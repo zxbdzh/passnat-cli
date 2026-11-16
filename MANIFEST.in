@@ -1,0 +1,9 @@
+include README.md LICENSE SECURITY.md passnat.cmd
+recursive-include skills *.md
+recursive-include docs *.md *.yml
+exclude INTEGRATION-NOTES.md
+prune docs/local
+prune private
+prune local_data
+prune PassNatCLI
+global-exclude *.dpapi *.pem *.key *.crt *.pfx *.p12 *.log *.frpc.toml *.Caddyfile .env .env.*

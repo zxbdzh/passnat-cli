@@ -1,0 +1,35 @@
+# Python 构建与缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# 本机联调材料与原始资料不属于公开交付
+/INTEGRATION-NOTES.md
+/docs/local/
+/private/
+/local_data/
+/PassNatCLI/
+
+# 凭证、运行配置、证书及日志不得进入版本控制
+.env
+.env.*
+*.dpapi
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+*.log
+*.frpc.toml
+*.Caddyfile
+/shared-*.json
+/preview-*.json
+/port-*.json
+/create-*.json
+/migration-*.json
+/credential*
+/export-*.toml
+/shared-*-certs/

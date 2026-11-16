@@ -1,0 +1,5 @@
+title: PassNAT CLI
+description: 用命令行管理 PassNAT 映射，为本地服务提供 HTTPS 预览。
+theme: jekyll-theme-minimal
+exclude:
+  - local
