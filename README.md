@@ -2,11 +2,15 @@
   <img src="docs/assets/readme-banner.png" alt="PassNAT CLI — Local services. Public HTTPS." width="1000" />
 </p>
 
-<h1 align="center">本地服务，一条 HTTPS 链接。</h1>
+<h1 align="center">Local services. Public HTTPS.</h1>
 
 <p align="center">
-  为开发演示、临时协作与静态分享而生的 PassNAT 命令行工具。<br />
-  多个站点共享一条隧道，先看变更，再决定执行。
+  A PassNAT command-line tool for demos, collaboration, and sharing static pages.<br />
+  Share one tunnel across multiple sites. Review changes before applying them.
+</p>
+
+<p align="center">
+  <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
 <p align="center">
@@ -16,39 +20,80 @@
 </p>
 
 <p align="center">
-  <a href="#快速开始">快速开始</a> ·
-  <a href="#让-ai-帮你安装">AI 一键安装</a> ·
-  <a href="https://zxbdzh.github.io/passnat-cli/">在线文档</a> ·
-  <a href="SECURITY.md">安全说明</a> ·
-  <a href="https://github.com/zxbdzh/passnat-cli/issues">反馈问题</a>
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#install-with-an-ai-assistant">AI-assisted install</a> ·
+  <a href="https://zxbdzh.github.io/passnat-cli/">Docs (中文)</a> ·
+  <a href="SECURITY.md">Security (中文)</a> ·
+  <a href="https://github.com/zxbdzh/passnat-cli/issues">Issues</a>
 </p>
 
 > [!NOTE]
-> **非官方社区项目**，与 PassNAT 官方无隶属关系。使用时需自行提供有权限的 PassNAT 账号与 SecretKey；安装与离线自检不需要密钥。
+> **Unofficial community project.** Not affiliated with PassNAT. Using the service requires your own authorized PassNAT account and SecretKey; installation and offline checks do not require credentials.
 
-## 为什么是 PassNAT CLI
+## Why PassNAT CLI
 
-分享一个本地功能，不应该顺手公开整个目录；新增一个演示，也不应该再启动一个互相争用的隧道客户端。
+Sharing a local feature should not expose an entire directory. Adding another demo should not mean starting another tunnel client that competes for the same connection.
 
-| 你要做的事 | 工具如何处理 |
+| What you need | How it works |
 | :--- | :--- |
-| **把本地应用交给别人体验** | Caddy 提供可信 HTTPS，应用继续使用原有登录与权限。 |
-| **同时分享多个站点** | 一条共享隧道、一个 frpc、一个 Caddy，新增站点通过热重载加入。 |
-| **只分享几张静态页面** | 逐个指定 HTML 白名单，不开放目录列表、配置文件或整个仓库。 |
-| **交给脚本或 AI 操作** | 结构化 JSON、明确退出码，平台资源写操作默认预演。 |
-| **结束临时演示** | 核对登记身份和完整映射参数后再回收，不接管来源不明的资源。 |
+| **Let others try a local app** | Caddy serves trusted HTTPS while the app keeps its existing login and permissions. |
+| **Share multiple sites** | One shared tunnel, one frpc, one Caddy. Add sites by reloading the existing setup. |
+| **Share a few static pages** | Allowlist individual HTML files instead of exposing directory listings, configuration files, or the whole repository. |
+| **Automate with scripts or AI** | Structured JSON, explicit exit codes, and dry runs by default for platform resource writes. |
+| **Take a demo offline** | Verify recorded ownership and the full mapping parameters before cleanup; do not take over unrecognized resources. |
 
-**共享优先，需要时独立。** 同一套 CLI 同时提供共享站点管理与专用预览，不修改应用业务源码。
+**Shared by default, dedicated when needed.** Manage shared sites or create a dedicated preview without changing your application's source code.
 
-## 快速开始
+## Architecture
 
-需要 **Python 3.11+** 和 Git。已有 [uv](https://docs.astral.sh/uv/) 时，使用隔离工具安装：
+The CLI is the **control plane**, not a proxy for visitors. It calls the PassNAT API, manages private local state, and generates the frpc and Caddy configuration.
+
+```mermaid
+flowchart TB
+    subgraph control["Control plane · local CLI"]
+        direction LR
+        operator["Developer / AI agent"] -->|Commands| cli["PassNAT CLI"]
+        cli -->|HTTPS API| api["PassNAT API"]
+        cli -->|Read / write| state["Private local files<br/>State · configs · certificates"]
+    end
+
+    subgraph traffic["Traffic path · shared HTTPS"]
+        direction LR
+        visitor["Visitor browser"] -->|HTTPS :443| relay["PassNAT public relay"]
+        relay -->|Tunnel| frpc["frpc<br/>One client per tunnel"]
+        frpc -->|TLS passthrough| caddy["Caddy<br/>Loopback TLS listener"]
+        caddy -->|HTTP| app["Local application<br/>Existing authentication"]
+        caddy -->|Serve| html["Allowlisted HTML"]
+    end
+
+    control ~~~ traffic
+```
+
+Visitor traffic follows a separate path: **HTTPS client → PassNAT public relay → a single frpc → Caddy's loopback TLS listener → a local HTTP app or allowlisted HTML files**. Caddy handles HTTPS locally; application authentication remains the application's responsibility.
+
+- **One shared tunnel, one client.** Multiple sites share the same managed frpc and Caddy; adding a site does not require another tunnel client.
+- **Keep private state out of the public path.** Credentials, generated configuration, certificates, and rollback snapshots belong in the private state directory, never in a site root.
+- **Publish only what you intend.** Proxy an app with its existing authentication, or explicitly allowlist the HTML files to serve.
+
+The diagram covers shared HTTPS mode. Dedicated previews have separate configuration and lifecycle. The relay is an external service; its internal implementation is outside this repository.
+
+| Module | Responsibility |
+| :--- | :--- |
+| [`cli.py`](passnat/cli.py) | Command parsing, dispatch, mutation locking, and structured output. |
+| [`core.py`](passnat/core.py) | API client, credentials, private files, ownership checks, and configuration filtering. |
+| [`shared.py`](passnat/shared.py) | Shared site registry, Caddy configuration, synchronization, process lifecycle, and public probes. |
+| [`preview.py`](passnat/preview.py) | Dedicated preview configuration, process lifecycle, status checks, and safe teardown. |
+
+## Quick start
+
+You need **Python 3.11+** and Git. If you have [uv](https://docs.astral.sh/uv/), install in an isolated tool environment:
 
 ```sh
 uv tool install --python 3.11 "git+https://github.com/zxbdzh/passnat-cli"
 ```
 
-没有 uv？也可以在自己的虚拟环境里从源码安装：
+No uv? Install from source in your own virtual environment:
 
 ```sh
 git clone https://github.com/zxbdzh/passnat-cli.git
@@ -56,7 +101,7 @@ cd passnat-cli
 python -m pip install .
 ```
 
-安装后先做不需要密钥的自检：
+Run these checks first. No credentials are needed:
 
 ```sh
 passnat --version
@@ -65,23 +110,44 @@ passnat schema
 ```
 
 > [!TIP]
-> Python 包的运行依赖仅使用标准库。真正创建 HTTPS 预览时，才需要你的 PassNAT 凭证，以及额外安装的 **frpc** 和 **Caddy**。
+> The Python package uses only the standard library at runtime. Creating an HTTPS preview additionally requires your PassNAT credentials and separately installed **frpc** and **Caddy** binaries.
 
-## 让 AI 帮你安装
+## Install with an AI assistant
 
-把这段复制给有终端操作能力的 AI 助手，让它完成安装和离线自检，而不只是返回教程：
+Copy this prompt to an AI assistant with terminal access. It asks the assistant to perform the installation and offline checks, not just describe the steps:
 
 ```text
-请按 https://zxbdzh.github.io/passnat-cli/ai-install.html 的安装说明，直接为当前电脑安装 PassNAT CLI 和当前 AI 的 passnat-preview 技能，并完成离线自检。只安装，不读取密钥、不创建隧道、不开放端口。
+Install PassNAT CLI from https://github.com/zxbdzh/passnat-cli on this computer,
+and install the repository's skills/passnat-preview skill for the current AI
+assistant. Perform the installation rather than only giving me instructions.
+
+1. Read README.md, SECURITY.md, and the skill's SKILL.md. Check the OS, Git,
+   Python 3.11+, and any existing CLI or skill installation. Preserve local
+   changes; ask before overwriting files or resolving permission conflicts.
+2. Use an isolated, user-level installation from that repository. Prefer
+   uv tool install --python 3.11 "git+https://github.com/zxbdzh/passnat-cli"
+   when uv is available; otherwise use existing pipx or a dedicated venv.
+   Do not substitute a similarly named PyPI package or modify system Python.
+3. Install the skill using this assistant's confirmed skill conventions.
+   If Magpie manages skills, use Magpie Library. Do not change other assistants,
+   global permissions, or security settings. Ask if the skill location is unclear.
+4. Verify passnat --version, passnat --help, and passnat schema. Check whether
+   frpc and Caddy are available; report missing preview dependencies honestly.
+5. Installation and offline checks only. Do not read, print, or request secrets,
+   copy existing runtime configuration, create tunnels, start persistent services,
+   or open public ports. No SecretKey is needed for this task.
+
+Report the CLI and skill locations, check results, missing dependencies, and any
+incomplete steps. Explain how I can safely configure my own credentials next.
 ```
 
-[完整安装提示词 →](https://zxbdzh.github.io/passnat-cli/ai-install.html) · [仓库内安装说明](docs/ai-install.md) · [Agent 技能](skills/passnat-preview/SKILL.md)
+[Full installation prompt — Chinese reference →](https://zxbdzh.github.io/passnat-cli/ai-install.html) · [Installation guide (Chinese)](docs/ai-install.md) · [Agent skill (Chinese)](skills/passnat-preview/SKILL.md)
 
-安装 CLI 和技能，不等于预览环境已经就绪；AI 会单独报告 frpc、Caddy 等依赖是否齐备。
+Installing the CLI and skill does **not** mean the preview environment is ready. The assistant should report the availability of frpc, Caddy, and other prerequisites separately. The linked documentation and skill are currently in Chinese; an English README does not imply that CLI help or error messages are localized.
 
-## 从查询到分享
+## From inspection to sharing
 
-先通过可信的本地凭证工具提供 `PASSNAT_SECRET_KEY`，或在 Windows 下使用 `passnat auth login --stdin` 保存当前用户的 DPAPI 加密凭证。**不要把真实密钥写入命令参数、脚本或聊天。**
+Provide `PASSNAT_SECRET_KEY` through a trusted local credential tool, or use `passnat auth login --stdin` on Windows to store a credential protected by the current user's DPAPI. **Never put a real key in command arguments, scripts, or chat.**
 
 ```sh
 passnat auth check
@@ -89,142 +155,142 @@ passnat tunnels list
 passnat domains list
 ```
 
-已有本工具登记的共享底座时，新增应用只需：
+If you already have a shared setup registered by this tool, add an app with:
 
 ```sh
-# 1. 先预演：核对域名、映射和上游。
+# 1. Dry run: review the domain, mapping, and upstream.
 passnat shared site dev demo --subdomain YOUR_SUBDOMAIN --domain-id DOMAIN_ID --upstream-port 8000
 
-# 2. 确认公开范围后执行，再热重载已有底座。
+# 2. Confirm what will be public, apply, and reload the existing setup.
 passnat shared site dev demo --subdomain YOUR_SUBDOMAIN --domain-id DOMAIN_ID --upstream-port 8000 --apply
 passnat shared sync dev --reload --apply
 
-# 3. 检查公网证书与目标站点状态。
+# 3. Check the public certificate and target site status.
 passnat shared status dev
 ```
 
-`dev` 是示例底座名，`YOUR_SUBDOMAIN`、`DOMAIN_ID` 等大写标识需要替换为当前账号实际资源。首次使用请展开下面的初始化步骤。
+`dev` is an example setup name. Replace uppercase placeholders such as `YOUR_SUBDOMAIN` and `DOMAIN_ID` with resources available to your account. For a first-time setup, expand the initialization guide below.
 
-## 使用指南
+## Usage guides
 
 <details>
-<summary><strong>共享模式 · 初始化底座与添加静态页面</strong></summary>
+<summary><strong>Shared mode · Initialize a setup and add static pages</strong></summary>
 
-选用**本工具创建并登记、没有其他客户端占用**的隧道。没有这样的隧道时，先按独立模式中的 `tunnels create` 示例创建；节点和域名权限以当前账号为准。
+Use a tunnel **created and registered by this tool, with no other client connected**. If you do not have one, create it using the `tunnels create` example under dedicated mode. Available nodes and domain permissions depend on your account.
 
 ```sh
-# 先预演，再执行初始化。
+# Review the dry run, then initialize.
 passnat shared init dev --tunnel TUNNEL_ID
 passnat shared init dev --tunnel TUNNEL_ID --apply
 
-# 登记首个站点：检查预演后执行，底座至少需要一个站点。
+# Register the first site: review before applying. At least one site is required.
 passnat shared site dev demo --subdomain YOUR_SUBDOMAIN --domain-id DOMAIN_ID --upstream-port 8000
 passnat shared site dev demo --subdomain YOUR_SUBDOMAIN --domain-id DOMAIN_ID --upstream-port 8000 --apply
 passnat shared sync dev --apply
 ```
 
-在两个独立终端或项目既有进程管理器中，分别前台运行：
+Run each process in the foreground in a separate terminal, or use your project's existing process manager:
 
 ```sh
 passnat shared run dev proxy
 passnat shared run dev frpc
 ```
 
-只分享静态 HTML 时，用绝对目录和明确文件列表：
+To share static HTML only, specify an absolute directory and an explicit file list:
 
 ```sh
 passnat shared site dev docs --subdomain YOUR_DOCS_SUBDOMAIN --domain-id DOMAIN_ID --root ABSOLUTE_PUBLIC_DIRECTORY --file index.html --file guide.html
 ```
 
-检查预演后重复命令并添加 `--apply`，再执行 `shared sync dev --reload --apply`。不需要为新站点启动第二个 frpc。
+Review the dry run, repeat the command with `--apply`, then run `shared sync dev --reload --apply`. You do not need a second frpc for the new site.
 
-Caddy 使用 TLS-ALPN-01 为公网 HTTPS 443 申请和续期证书，平台映射指向本机共享 TLS 端口。普通 HTTP 上游不能直接当成 HTTPS 端口使用。
+Caddy uses TLS-ALPN-01 to obtain and renew certificates through public HTTPS port 443. The platform mapping points to the local shared TLS port. A plain HTTP upstream cannot be used directly as an HTTPS endpoint.
 
 </details>
 
 <details>
-<summary><strong>独立模式 · 为需要隔离的应用创建专用预览</strong></summary>
+<summary><strong>Dedicated mode · Create an isolated preview for an app</strong></summary>
 
-frpc 可放入 `PATH`、由 `PASSNAT_FRPC` 提供，或通过 `preview up --frpc` 指定。Caddy 可使用 `passnat tools install-caddy` 安装；独立模式也支持 `PASSNAT_CADDY`，共享模式使用私有目录中的 `bin/caddy.exe`。
+Put frpc in `PATH`, set `PASSNAT_FRPC`, or specify it with `preview up --frpc`. Install Caddy with `passnat tools install-caddy`. Dedicated mode also supports `PASSNAT_CADDY`; shared mode uses `bin/caddy.exe` inside the private directory.
 
 ```sh
-# 创建专用隧道：先预演，确认后重复命令并添加 --apply。
+# Create a dedicated tunnel: review, then repeat with --apply.
 passnat tunnels create mypreview --node-id NODE_ID --port-name demo-tcp --protocol https --local-port 443 --subdomain YOUR_SUBDOMAIN --domain-id DOMAIN_ID
 
-# 使用创建后返回的隧道 ID；同样先预演，再添加 --apply。
+# Use the tunnel ID returned above; review, then add --apply here too.
 passnat preview up demo --tunnel TUNNEL_ID --local-port 8000 --public-port 443 --domain-id DOMAIN_ID --subdomain YOUR_SUBDOMAIN
 
-# 配置完成后，在两个独立终端分别运行。
+# Once configured, run each process in a separate terminal.
 passnat preview run demo proxy
 passnat preview run demo frpc
 passnat preview status demo
 ```
 
-`tools install-caddy` 从官方发行地址下载并校验程序，当前自动安装只支持 Windows amd64。该命令会安装软件，不属于 `--apply` 控制的平台资源预演。
+`tools install-caddy` downloads and verifies the binary from the official release source. Automatic installation currently supports Windows amd64 only. This command installs software; it is not a platform resource dry run controlled by `--apply`.
 
 </details>
 
 <details>
-<summary><strong>回收与迁移 · 先确认归属，再停止分享</strong></summary>
+<summary><strong>Cleanup and migration · Confirm ownership before taking a site offline</strong></summary>
 
 ```sh
 passnat ports delete LOCAL_PORT_NAME
 passnat preview down demo
 ```
 
-核对预演后再添加 `--apply`。`ports delete` 接受本地登记名，不是代理 UUID。
+Review the dry run before adding `--apply`. `ports delete` takes a locally registered name, not a proxy UUID.
 
-**独立预览下线可能删除整个专用隧道，链接会失效，并非暂停。** 映射身份或参数变化、出现其他服务、缺少归属记录时拒绝自动下线。共享单站点不能使用 `preview down`。
+**Taking down a dedicated preview may delete its entire dedicated tunnel. The link will stop working; this is not a pause.** Automatic teardown is refused if mapping identities or parameters have changed, other services are present, or ownership records are missing. Do not use `preview down` for an individual shared site.
 
-迁移前阅读 `passnat shared migrate --help`。工具保存私有回滚快照，但域名切换可能短暂中断；写请求结果不确定时先对账，不盲目重发。
+Read `passnat shared migrate --help` before migrating. The tool keeps private rollback snapshots, but switching domains may briefly interrupt service. If the outcome of a write request is uncertain, reconcile the actual state before retrying.
 
 </details>
 
 <details>
-<summary><strong>脚本与 Agent · JSON 输出、退出码与技能</strong></summary>
+<summary><strong>Scripts and agents · JSON output, exit codes, and the skill</strong></summary>
 
-成功返回 `{"ok": true, "data": {}, "meta": {}}`，失败返回 `{"ok": false, "error": {}}`。运行进程日志使用 stderr。
+Successful commands return `{"ok": true, "data": {}, "meta": {}}`; failures return `{"ok": false, "error": {}}`. Process logs go to stderr.
 
-| 退出码 | 含义 |
+| Exit code | Meaning |
 | :---: | :--- |
-| `0` | 成功 |
-| `1` | 网络、平台 API 或运行错误 |
-| `2` | 鉴权错误 |
-| `3` | 参数或归属校验错误 |
+| `0` | Success |
+| `1` | Network, platform API, or runtime error |
+| `2` | Authentication error |
+| `3` | Argument or ownership validation error |
 
-`passnat schema` 提供输出约定；各资源的 `--help` 提供当前命令参数。
+`passnat schema` describes the output contract. Each resource's `--help` lists its current command arguments.
 
-随仓库提供的 [passnat-preview 技能](skills/passnat-preview/SKILL.md) 描述共享、验证和回收流程。按当前 Agent 的技能约定安装；技能本身不包含凭证，也不会自动安装 frpc 或 Caddy。
+The bundled [passnat-preview skill (Chinese)](skills/passnat-preview/SKILL.md) describes sharing, verification, and cleanup workflows. Install it according to your agent's skill conventions. The skill contains no credentials and does not automatically install frpc or Caddy.
 
 </details>
 
-## 公开链接，不公开密钥
+## Share links, not secrets
 
-- **私有文件留在本机。** 默认状态目录位于仓库外；frpc 配置、证书、DPAPI 文件和迁移快照不属于公开交付。
-- **保留原应用认证。** 登录、Cookie 与回调边界继续由应用负责，本工具不提供绕过认证的能力。
-- **不争用隧道身份。** 一条隧道只运行一个受管 frpc，不与桌面客户端或其他机器共用同一在线身份。
-- **按真实公网验证。** 状态检查连接平台公网节点，保留域名 SNI/Host 并校验证书，不把回环直连当作公网成功。
-- **脱敏不等于可以直接公开。** 任意文本字符串、第三方日志和业务数据仍可能含敏感信息，分享前需人工检查。
+- **Keep private files local.** The default state directory is outside the repository. frpc configuration, certificates, DPAPI files, and migration snapshots are not public deliverables.
+- **Keep application authentication.** The app remains responsible for login, cookies, and callback boundaries. This tool does not bypass authentication.
+- **Do not compete for a tunnel identity.** Run one managed frpc per tunnel. Do not share the same online identity with a desktop client or another machine.
+- **Verify the real public endpoint.** Status checks connect to the platform's public node, preserve the domain's SNI/Host, and validate the certificate. A successful loopback connection is not treated as public success.
+- **Redacted does not mean safe to publish.** Arbitrary strings, third-party logs, and application data may still contain sensitive information. Review them before sharing.
 
-默认私有目录：Windows 为 `%LOCALAPPDATA%/PassNatCLI`，其他系统为 `$HOME/.local/share/PassNatCLI`。`PASSNAT_HOME` 只能指向本人可访问的私有目录，不要指向仓库、共享目录或站点根目录。
+The default private directory is `%LOCALAPPDATA%/PassNatCLI` on Windows and `$HOME/.local/share/PassNatCLI` elsewhere. Point `PASSNAT_HOME` only to a private directory accessible to you, never to a repository, shared directory, or site root.
 
-**DPAPI 只保护保存的登录凭证，不会加密全部运行配置。** 完整边界与报告方式见 [SECURITY.md](SECURITY.md)。
+**DPAPI protects stored login credentials only; it does not encrypt all runtime configuration.** See [SECURITY.md (Chinese)](SECURITY.md) for the full security boundaries and reporting instructions.
 
-## 兼容性与验证
+## Compatibility and verification
 
-| 项目 | 当前状态 |
+| Component | Current status |
 | :--- | :--- |
-| Python | 3.11+；运行依赖仅使用标准库。 |
-| Windows | 主要使用环境；支持 DPAPI 凭证保存。 |
-| Linux / 其他系统 | 可通过环境变量提供凭证；预览能力需在目标环境实测。 |
-| 自动测试 | GitHub Actions 覆盖 Windows / Ubuntu × Python 3.11 / 3.13。 |
-| 外部依赖 | HTTPS 预览需要 frpc、Caddy 与可用的 PassNAT 账号资源。 |
+| Python | 3.11+; standard-library-only runtime dependencies. |
+| Windows | Primary usage environment; supports DPAPI credential storage. |
+| Linux / other systems | Credentials can be supplied through environment variables; verify preview functionality in the target environment. |
+| Automated tests | GitHub Actions covers Windows / Ubuntu × Python 3.11 / 3.13. |
+| External dependencies | HTTPS previews require frpc, Caddy, and usable PassNAT account resources. |
 
-单元测试使用合成数据和 mock，不创建真实平台资源。**CI 通过不等于真实应用的登录、上传或播放已经验收。**
+Unit tests use synthetic data and mocks; they do not create real platform resources. **Passing CI does not verify login, uploads, or playback in a real application.**
 
-## 参与项目
+## Contributing
 
-欢迎提交可复现的问题和范围清楚的改进。反馈时请附版本、系统、脱敏复现步骤与期望行为；不要粘贴密钥、完整配置或真实用户信息。
+Reproducible bug reports and focused improvements are welcome. Include your version, OS, sanitized reproduction steps, and expected behavior. Do not paste keys, full configuration files, or real user data.
 
 ```sh
 git clone https://github.com/zxbdzh/passnat-cli.git
@@ -232,13 +298,13 @@ cd passnat-cli
 python -m unittest discover -s tests -v
 ```
 
-[提交问题](https://github.com/zxbdzh/passnat-cli/issues/new) · [查看测试](https://github.com/zxbdzh/passnat-cli/actions/workflows/tests.yml) · [安全报告说明](SECURITY.md#漏洞报告)
+[Report an issue](https://github.com/zxbdzh/passnat-cli/issues/new) · [View tests](https://github.com/zxbdzh/passnat-cli/actions/workflows/tests.yml) · [Security reporting (Chinese)](SECURITY.md#漏洞报告)
 
-如果它帮你省下了反复配置预览的时间，欢迎点一颗 **Star**，也欢迎告诉我们你最想简化的下一步。
+If this saves you time setting up previews, a **Star** is appreciated. We'd also like to hear what you want to make simpler next.
 
 ---
 
 <p align="center">
-  <a href="LICENSE">MIT License</a> · 社区维护，非 PassNAT 官方产品<br />
-  <sub>PassNAT 服务、frpc 和 Caddy 的商标、服务条款及许可证分别归各自权利人所有。</sub>
+  <a href="LICENSE">MIT License</a> · Community maintained. Not an official PassNAT product.<br />
+  <sub>PassNAT, frpc, and Caddy retain their respective trademarks, service terms, and licenses.</sub>
 </p>
