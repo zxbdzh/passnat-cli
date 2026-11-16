@@ -16,6 +16,18 @@
 - 通过公网节点地址连接，保留域名 SNI/Host 并校验证书，区分本机直连与真实公网访问。
 - 保留应用原有登录、Cookie 与回调边界，不提供绕过认证的能力。
 
+## 让 AI 一键安装
+
+把下面这段发给有终端操作能力的 AI 助手：
+
+```text
+请按 https://zxbdzh.github.io/passnat-cli/ai-install.html 的安装说明，直接为当前电脑安装 PassNAT CLI 和当前 AI 的 passnat-preview 技能，并完成离线自检。只安装，不读取密钥、不创建隧道、不开放端口。
+```
+
+[查看完整安装提示词](https://zxbdzh.github.io/passnat-cli/ai-install.html) · [仓库内安装说明](docs/ai-install.md)
+
+安装 CLI 和技能不需要 SecretKey；frpc、Caddy 是后续 HTTPS 预览的额外依赖，AI 会单独报告缺失项。
+
 ## 环境与安装
 
 - Python **3.11 或更高版本**，Python 运行依赖仅使用标准库。

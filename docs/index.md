@@ -9,6 +9,16 @@ title: PassNAT CLI
 
 [查看源码与完整使用说明](https://github.com/zxbdzh/passnat-cli) · [MIT 许可证](https://github.com/zxbdzh/passnat-cli/blob/main/LICENSE)
 
+## 让 AI 一键安装
+
+把这段发给有终端操作能力的 AI 助手即可：
+
+```text
+请按 https://zxbdzh.github.io/passnat-cli/ai-install.html 的安装说明，直接为当前电脑安装 PassNAT CLI 和当前 AI 的 passnat-preview 技能，并完成离线自检。只安装，不读取密钥、不创建隧道、不开放端口。
+```
+
+[查看完整提示词与安装边界](ai-install.html)。安装无需 SecretKey，frpc 和 Caddy 的准备情况会单独报告。
+
 ## 在自己的电脑上运行
 
 需要 Python 3.11+，预览功能另外需要 PassNAT 账号、frpc 和 Caddy。
