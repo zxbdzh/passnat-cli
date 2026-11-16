@@ -1,6 +1,6 @@
 include README.md LICENSE SECURITY.md passnat.cmd
 recursive-include skills *.md
-recursive-include docs *.md *.yml
+recursive-include docs *.md *.yml *.png
 exclude INTEGRATION-NOTES.md
 prune docs/local
 prune private
