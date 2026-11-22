@@ -56,7 +56,7 @@ passnat plan --device same --protocol https --apps 2
 | 场景 | 使用 | 不要 |
 | :--- | :--- | :--- |
 | **同一设备、多个 HTTPS 应用** | 复用一套底座：`shared site` 登记，`shared sync --reload --apply` 热加载；首条映射用 `tunnels create --caddy-tls-port` | 不要为第二个应用再建一条隧道或第二个 frpc |
-| **同一设备、单个 HTTPS 应用** | 独立 `preview up`：先用 `tunnels create --caddy-tls-port 443` 登记隧道首条映射，再用 `preview run NAME proxy` 启动 Caddy | 不要自动套用共享复用 |
+| **同一设备、单个 HTTPS 应用** | 独立 `preview up`：先用 `tunnels create --port-name <NAME>-tcp --caddy-tls-port 443` 登记隧道首条映射，执行 `preview up NAME --public-port 443 ... --apply`，再启动 `preview run NAME proxy` 和 `preview run NAME frpc` | 不要自动套用共享复用 |
 | **HTTP / TCP / UDP** | HTTP：`tunnels create --protocol http`；TCP：在已有隧道上用 `ports add --protocol tcp --remote-port …`，TCP 不能作为 `tunnels create` 的首条映射；UDP 当前不支持，CLI 返回 `unsupported_protocol` | 不要进入 Caddy HTTPS 共享流程，也不要假装 TCP 能作为首条映射或 UDP 可用 |
 | **不同设备** | 目标设备独立建隧道与独立 frpc 身份 | 不要复用同一隧道 ID、frpc 配置或进程身份 |
 
@@ -278,7 +278,10 @@ frpc / Caddy 路径按上面的平台说明探测。下面使用独立预览示�
 
 ```sh
 # 先确认受管 Caddy 已就位。
+# macOS / Linux：
 ls -l "${PASSNAT_HOME:-$HOME/.local/share/PassNatCLI}/bin/caddy"
+# Windows PowerShell：
+# Get-Item "$(if ($env:PASSNAT_HOME) { $env:PASSNAT_HOME } else { "$env:LOCALAPPDATA\PassNatCLI" })\bin\caddy.exe"
 passnat --help
 
 # 创建专用隧道：先预演，核对节点、域名和映射，再加 --apply 执行。
@@ -289,11 +292,11 @@ passnat --help
 passnat tunnels create mypreview --node-id NODE_ID --port-name demo-tcp --caddy-tls-port 443 --subdomain YOUR_SUBDOMAIN --domain-id DOMAIN_ID
 
 # 预览名是 demo，因此它会查找 demo-http / demo-tcp。
-# --public-port 必须等于上面 --caddy-tls-port 的值；--local-port 是应用的普通 HTTP 端口。
+# 该 --caddy-tls-port 衔接方式仅适用于 --public-port 443；--local-port 是应用的普通 HTTP 端口。
 passnat preview up demo --tunnel TUNNEL_ID --local-port 8000 --public-port 443 --domain-id DOMAIN_ID --subdomain YOUR_SUBDOMAIN
 ```
 
-两条命令必须使用同一套身份：`passnat preview up demo` 会复用登记为 `demo-tcp` 的映射（公网端口不是 443 时还会用 `demo-http`），所以首个 `--port-name` 必须是 `<preview-name>-tcp`——`preview demo` 对应 `demo-tcp`，不能随意改名。两条命令的 `--subdomain`、`--domain-id` 必须一致，`--public-port` 必须与 `--caddy-tls-port` 同值（这里都是 `443`）。`--local-port` 永远指应用自己的普通 HTTP 端口，不是 TLS 监听。`preview up` 与其他写操作一样，核对预演后加 `--apply` 才真正写入。
+两条命令必须使用同一套身份：`passnat preview up demo` 在 `443` 公网端口下会复用登记为 `demo-tcp` 的映射，所以首个 `--port-name` 必须是 `<preview-name>-tcp`——`preview demo` 对应 `demo-tcp`，不能随意改名。两条命令的 `--subdomain`、`--domain-id` 必须一致，且 `--caddy-tls-port` 与 `--public-port` 必须同为 `443`（`--caddy-tls-port` 固定创建 `protocol=https`、`remote_port=443`；非 443 高端口预览则要求首条映射为 `<preview-name>-http` 的 `http` 映射，再由 `preview up` 新建裸 `tcp` 映射）。`--local-port` 永远指应用自己的普通 HTTP 端口，不是 TLS 监听。`preview up` 与其他写操作一样，核对预演后加 `--apply` 才真正写入。
 
 **`--protocol https` 的含义是「本地端口本身就是 TLS」。** 普通 HTTP 应用（例如监听 5000 或 8000 的开发服务器）直接声明为 HTTPS 映射，访客会连到明文端口，表现为协议错配。这类应用应使用 `passnat shared site --upstream-port` 或 `passnat preview up`，由本地 Caddy 终结 TLS。`ports add --protocol https` 与 `tunnels create --protocol https` 因此要求同时加 `--local-tls` 确认本地端口已是 TLS 监听，否则在读取凭证和发起请求之前就以退出码 3 拒绝。
 

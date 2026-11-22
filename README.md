@@ -56,7 +56,7 @@ passnat plan --device same --protocol https --apps 2
 | Scenario | Use | Do not |
 | :--- | :--- | :--- |
 | **Same device, multiple HTTPS apps** | Reuse one base: register with `shared site`, hot-reload with `shared sync --reload --apply`; create the first mapping with `tunnels create --caddy-tls-port` | Create a second tunnel or a second frpc for the next app |
-| **Same device, single HTTPS app** | Dedicated `preview up`: register the tunnel's first mapping with `tunnels create --caddy-tls-port 443`, then run Caddy with `preview run NAME proxy` | Auto-apply shared reuse |
+| **Same device, single HTTPS app** | Dedicated `preview up`: register the tunnel's first mapping with `tunnels create --port-name <NAME>-tcp --caddy-tls-port 443`, run `preview up NAME --public-port 443 ... --apply`, then start `preview run NAME proxy` and `preview run NAME frpc` | Auto-apply shared reuse |
 | **HTTP / TCP / UDP** | HTTP: `tunnels create --protocol http`. TCP: `ports add --protocol tcp --remote-port …` on an existing tunnel — TCP cannot be a `tunnels create` first mapping. UDP is not supported and returns `unsupported_protocol` | Enter the Caddy HTTPS shared flow, or pretend TCP can be a first mapping or that UDP works |
 | **Different devices** | An independent tunnel and frpc identity on the target device | Reuse the same tunnel ID, frpc config, or process identity |
 
@@ -313,7 +313,10 @@ The following dedicated-preview example has platform writes disabled until `--ap
 
 ```sh
 # Verify the managed Caddy executable and CLI.
+# macOS / Linux:
 ls -l "${PASSNAT_HOME:-$HOME/.local/share/PassNatCLI}/bin/caddy"
+# Windows PowerShell:
+# Get-Item "$($env:PASSNAT_HOME ? $env:PASSNAT_HOME : "$env:LOCALAPPDATA\PassNatCLI")\bin\caddy.exe"
 passnat --help
 
 # Create a dedicated tunnel: review node/domain/mapping, then repeat with --apply.
@@ -324,11 +327,11 @@ passnat --help
 passnat tunnels create mypreview --node-id NODE_ID --port-name demo-tcp --caddy-tls-port 443 --subdomain YOUR_SUBDOMAIN --domain-id DOMAIN_ID
 
 # The preview name is demo, so it looks for demo-http / demo-tcp.
-# --public-port must equal the --caddy-tls-port used above; --local-port is the app's plain HTTP port.
+# This --caddy-tls-port pairing requires --public-port 443; --local-port is the app's plain HTTP port.
 passnat preview up demo --tunnel TUNNEL_ID --local-port 8000 --public-port 443 --domain-id DOMAIN_ID --subdomain YOUR_SUBDOMAIN
 ```
 
-The two commands must agree on identity: `passnat preview up demo` reuses the mappings registered as `demo-tcp` (and `demo-http` when the public port is not 443), so the initial `--port-name` must be `<preview-name>-tcp` — `demo-tcp` for `preview demo`, not an arbitrary label. Use the same `--subdomain` and `--domain-id` in both commands, and set `--public-port` to the same value as `--caddy-tls-port` (`443` here). `--local-port` is always the application's plain HTTP port; it is never the TLS listener. `preview up` adds `--apply` for the write, just like the other commands.
+The two commands must agree on identity: `passnat preview up demo` reuses the mappings registered as `demo-tcp` (and `demo-http` when the public port is not 443), so for a `443` preview the initial `--port-name` must be `<preview-name>-tcp` — `demo-tcp` for `preview demo`, not an arbitrary label. Use the same `--subdomain` and `--domain-id` in both commands, and keep both `--caddy-tls-port` and `--public-port` at `443` (`--caddy-tls-port` always writes `protocol=https` and `remote_port=443`, whereas non-443 `preview up` expects `<preview-name>-http` as the initial `http` mapping and creates `<preview-name>-tcp` as bare `tcp`). `--local-port` is always the application's plain HTTP port; it is never the TLS listener. `preview up` adds `--apply` for the write, just like the other commands.
 
 **`--protocol https` means "the local port itself speaks TLS."** Mapping a plain HTTP app (say a dev server on 5000 or 8000) as HTTPS sends visitors to the cleartext port and shows up as a protocol mismatch. Those apps should use `passnat shared site --upstream-port` or `passnat preview up`, with Caddy terminating TLS. Accordingly, `ports add --protocol https` and `tunnels create --protocol https` require `--local-tls` to confirm the local port really is a TLS listener; without it the command is rejected with exit code 3 before any credential is read or request sent.
 

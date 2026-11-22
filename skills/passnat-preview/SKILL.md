@@ -36,7 +36,7 @@ passnat plan --device same --protocol https --apps 2
 | 场景 | 正确路径 | 禁止 |
 | :--- | :--- | :--- |
 | 同一设备、多个 HTTPS 应用 | 复用一套共享底座：首条映射 `tunnels create --caddy-tls-port`，之后 `shared site` 登记 + `shared sync --reload --apply` | 为第二个应用再建隧道或第二个 frpc |
-| 同一设备、单个 HTTPS 应用 | 独立 `preview up` 或独立 `tunnels create` | 自动套用共享复用 |
+| 同一设备、单个 HTTPS 应用 | 独立预览：`tunnels create --port-name <NAME>-tcp --caddy-tls-port 443` → `preview up NAME --public-port 443` → `preview run NAME proxy` / `frpc`（直接 `tunnels create` 仅用于已有自管 TLS 监听的高级场景） | 自动套用共享复用 |
 | HTTP / TCP / UDP | 按协议单独建隧道/映射（`--protocol http` / `--protocol tcp`） | 进入 Caddy HTTPS 共享流程 |
 | 不同设备 | 目标设备独立建隧道与独立 frpc 身份 | 复用同一隧道 ID、frpc 配置或进程身份 |
 
@@ -120,7 +120,7 @@ curl -fsS https://APP_SUBDOMAIN.DOMAIN/
 
 ## 独立模式与回收
 
-只有明确需要隔离时使用 `preview up/run/down`。不得绕过共享或在线客户端保护。下线先预演，核对本地登记、远端映射 ID、完整参数及专用隧道归属，再使用 `--apply`。独立下线可能删除整个专用隧道；共享单站点不能使用 `preview down`。
+单应用默认使用独立预览；多应用同设备复用共享底座；明确需要隔离时也可选择 `preview up/run/down`。不得绕过共享或在线客户端保护。下线先预演，核对本地登记、远端映射 ID、完整参数及专用隧道归属，再使用 `--apply`。独立下线可能删除整个专用隧道；共享单站点不能使用 `preview down`。
 
 迁移先查 `shared migrate --help`，校验来源和目标，保留私有回滚快照。写请求异常先对账，不盲目重发或接管外部资源。
 
