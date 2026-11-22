@@ -16,7 +16,7 @@ import urllib.request
 from pathlib import Path
 
 from .core import Client, Failure, ensure_home, filtered_config, load_state, matches, mutation_lock, owned_path, port_number, save_state, write_private, add_port
-from .preview import find_frpc
+from .preview import find_caddy, find_frpc
 
 
 def state_for(name):
@@ -61,9 +61,7 @@ def init(client, name, tunnel_id, tls_port, admin_port, challenge_port, apply):
     state.setdefault('sites', {})
     state.setdefault('frpc_admin_password', secrets.token_urlsafe(32))
     state['frpc'] = find_frpc()
-    state['caddy'] = str(ensure_home() / 'bin/caddy.exe')
-    if not Path(state['caddy']).is_file():
-        raise Failure('caddy_missing', '请先安装 Caddy。', 3)
+    state['caddy'] = find_caddy()
     save_state(name, state, 'shared-')
     return dict(configured=True, name=name, site_count=len(state['sites']))
 
@@ -126,7 +124,7 @@ def caddy_config(state):
             continue
         lines += [f'https://{site["domain"]} {{', '    bind 127.0.0.1', '    tls {', '        issuer acme {', '            disable_http_challenge', '        }', '    }', '    header X-Robots-Tag "noindex, nofollow, noarchive"']
         if 'upstream_port' in site:
-            lines += [f'    reverse_proxy http://localhost:{site["upstream_port"]} {{', '        flush_interval -1', '        header_down Set-Cookie "^(.*)$" "$1; Secure"', '    }']
+            lines += [f'    reverse_proxy http://127.0.0.1:{site["upstream_port"]} {{', '        flush_interval -1', '        header_down Set-Cookie "^(.*)$" "$1; Secure"', '    }']
         else:
             paths = ['/'] + ['/' + filename for filename in site['files']]
             lines += ['    @published {', '        method GET HEAD', '        path ' + ' '.join(paths), '    }', '    handle @published {', f'        root * {json.dumps(Path(site["root"]).as_posix())}', '        file_server', '    }', '    handle {', '        respond 404', '    }']

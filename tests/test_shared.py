@@ -31,19 +31,78 @@ class SharedClient:
 class SharedTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.env = patch.dict(os.environ, {'PASSNAT_HOME': self.temp.name})
+        self.env = patch.dict(os.environ, {'PASSNAT_HOME': self.temp.name, 'PASSNAT_CADDY': ''})
         self.env.start()
+        # 共享网关本身与平台无关；这里固定为非 macOS，环境变量/受管目录的解析由 preview 测试覆盖。
+        self.platform = patch('passnat.preview._caddy_platform', return_value='windows')
+        self.platform.start()
         self.client = SharedClient()
         save_state('dev', dict(tunnel_id='test', status='active'), 'create-')
         binary = Path(self.temp.name)/'bin/caddy.exe'
         binary.parent.mkdir()
-        binary.touch()
+        binary.write_text('#!/bin/sh\nexit 0\n')
+        binary.chmod(0o755)
         with patch('passnat.shared.find_frpc', return_value='frpc.exe'):
             init(self.client, 'dev', 'test', 18446, 54216, 18283, True)
 
     def tearDown(self):
+        self.platform.stop()
         self.env.stop()
         self.temp.cleanup()
+
+    def test_init_honors_passnat_caddy_env(self):
+        custom = Path(self.temp.name)/'custom'/'caddy'
+        custom.parent.mkdir()
+        custom.write_text('#!/bin/sh\nexit 0\n')
+        custom.chmod(0o755)
+        with patch.dict(os.environ, {'PASSNAT_CADDY': str(custom)}), patch('passnat.shared.find_frpc', return_value='frpc.exe'):
+            init(self.client, 'env', 'test', 18446, 54216, 18283, True)
+        self.assertEqual(load_state('env', 'shared-')['caddy'], str(custom.resolve()))
+        # 默认状态也不应再被硬编码路径覆盖。
+        self.assertEqual(load_state('dev', 'shared-')['caddy'], str((Path(self.temp.name)/'bin/caddy.exe').resolve()))
+
+    def test_init_reports_missing_caddy_with_hints(self):
+        with tempfile.TemporaryDirectory() as empty, \
+             patch.dict(os.environ, {'PASSNAT_HOME': empty, 'PASSNAT_CADDY': ''}), \
+             patch('passnat.preview.shutil.which', return_value=None), \
+             patch('passnat.shared.find_frpc', return_value='frpc.exe'):
+            save_state('dev', dict(tunnel_id='test', status='active'), 'create-')
+            with self.assertRaises(Failure) as found:
+                init(self.client, 'missing', 'test', 18446, 54216, 18283, True)
+            self.assertEqual(found.exception.code, 'caddy_missing')
+            self.assertIn('PASSNAT_CADDY', str(found.exception))
+            self.assertIsNone(load_state('missing', 'shared-'))
+
+    def test_macos_init_uses_managed_caddy_and_ignores_env(self):
+        managed = Path(self.temp.name)/'bin'/'caddy'
+        managed.write_text('#!/bin/sh\nexit 0\n')
+        managed.chmod(0o755)
+        custom = Path(self.temp.name)/'custom'/'caddy'
+        custom.parent.mkdir()
+        custom.write_text('#!/bin/sh\nexit 0\n')
+        custom.chmod(0o755)
+        with patch('passnat.preview._caddy_platform', return_value='macos'), \
+             patch.dict(os.environ, {'PASSNAT_CADDY': str(custom)}), \
+             patch('passnat.shared.find_frpc', return_value='frpc.exe'):
+            init(self.client, 'mac', 'test', 18446, 54216, 18283, True)
+        self.assertEqual(load_state('mac', 'shared-')['caddy'], str(managed.resolve()))
+
+    def test_macos_init_requires_managed_caddy(self):
+        custom = Path(self.temp.name)/'custom'/'caddy'
+        custom.parent.mkdir()
+        custom.write_text('#!/bin/sh\nexit 0\n')
+        custom.chmod(0o755)
+        with tempfile.TemporaryDirectory() as empty, \
+             patch.dict(os.environ, {'PASSNAT_HOME': empty, 'PASSNAT_CADDY': str(custom)}), \
+             patch('passnat.preview._caddy_platform', return_value='macos'), \
+             patch('passnat.shared.find_frpc', return_value='frpc.exe'):
+            save_state('dev', dict(tunnel_id='test', status='active'), 'create-')
+            with self.assertRaises(Failure) as found:
+                init(self.client, 'mac-missing', 'test', 18446, 54216, 18283, True)
+            self.assertEqual(found.exception.code, 'caddy_missing')
+            self.assertIn('install-caddy', str(found.exception))
+            self.assertNotIn('PASSNAT_CADDY', str(found.exception))
+            self.assertIsNone(load_state('mac-missing', 'shared-'))
 
     def test_dry_run_no_remote_or_site_writes(self):
         result=add_site(self.client,'dev','app','app',3,8000,None,[],False)
@@ -57,6 +116,7 @@ class SharedTests(unittest.TestCase):
         self.assertEqual(len(self.client.rows),2)
         self.assertEqual({row['local_port'] for row in self.client.rows},{18446})
         self.assertEqual(len(load_state('dev','shared-')['sites']),2)
+        self.assertIn('reverse_proxy http://127.0.0.1:8000', caddy_config(load_state('dev','shared-')))
 
     def test_unknown_mapping_not_adopted(self):
         self.client.rows.append(dict(id=7,proxy_name='foreign'))
