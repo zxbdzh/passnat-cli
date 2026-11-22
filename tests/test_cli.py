@@ -279,6 +279,18 @@ class HttpsMappingGuardTests(unittest.TestCase):
             dispatch(self.ports_add(protocol="tcp", local_port=5432, remote_port=15432, subdomain=None, domain_id=None))
         self.assertEqual(add_port.call_args.args[3]["protocol"], "tcp")
 
+    def test_ports_add_http_or_https_rejects_conflicting_remote_port_before_credentials(self):
+        for protocol, remote_port in (("http", 8443), ("https", 8080)):
+            with self.subTest(protocol=protocol, remote_port=remote_port), \
+                 patch("passnat.cli.Client") as client, \
+                 patch("passnat.cli.add_port") as add_port:
+                with self.assertRaises(Failure) as found:
+                    dispatch(self.ports_add(protocol=protocol, local_tls=True, remote_port=remote_port))
+                self.assertEqual(found.exception.code, "conflicting_mapping_options")
+                self.assertEqual(found.exception.exit_code, 3)
+                client.assert_not_called()
+                add_port.assert_not_called()
+
 
 class PlanTests(unittest.TestCase):
     # 分流决策必须纯本地：不读凭证、不联网、不写状态，且不替用户猜设备。
@@ -296,15 +308,22 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(result["network_accessed"])
         self.assertFalse(result["state_written"])
         steps = " ".join(result["steps"])
+        self.assertIn("shared init NAME --tunnel TUNNEL_ID --tls-port TLS_PORT --apply", steps)
         self.assertIn("shared site", steps)
-        self.assertIn("shared sync", steps)
-        self.assertIn("shared run", steps)
+        self.assertIn("shared sync NAME --apply", steps)
+        self.assertNotIn("--reload", steps)
+        self.assertLess(steps.index("shared sync NAME --apply"), steps.index("shared run NAME proxy"))
+        self.assertIn("--reload --apply", " ".join(result["notes"]))
 
     def test_same_device_single_https_does_not_auto_reuse(self):
         result = dispatch(self.plan(apps=1))
         self.assertEqual(result["mode"], "single_https")
         self.assertFalse(result["reuse_shared"])
-        self.assertIn("preview up", " ".join(result["steps"]))
+        steps = " ".join(result["steps"])
+        self.assertIn("--port-name NAME-tcp --caddy-tls-port 443", steps)
+        self.assertIn("preview up NAME", steps)
+        self.assertIn("--local-port APP_HTTP_PORT --public-port 443", steps)
+        self.assertNotIn("--local-port PORT --public-port PORT", steps)
 
     def test_http_and_tcp_never_enter_shared_caddy(self):
         for protocol in ("http", "tcp"):
@@ -360,6 +379,14 @@ class PlanTests(unittest.TestCase):
     def test_shared_help_states_https_only(self):
         from passnat.cli import parser
         self.assertIn("不要进入此流程", parser().format_help())
+
+    def test_preview_up_help_explains_443_and_non_443_mappings(self):
+        from passnat.cli import parser
+        help_io = io.StringIO()
+        # 通过 subparsers 输出 preview 子命令帮助，确认说明 443 单映射与非 443 双映射。
+        with self.assertRaises(SystemExit), patch("sys.stdout", help_io):
+            parser().parse_args(["preview", "--help"])
+        self.assertIn("443 用单个 HTTPS 映射", help_io.getvalue())
 
 
 class ToolsInstallCaddyTests(unittest.TestCase):

@@ -67,7 +67,7 @@ def parser() -> argparse.ArgumentParser:
     export.add_argument("--proxy-name", action="append", required=True)
     export.add_argument("--apply", action="store_true")
     preview = groups.add_parser("preview", help="创建可信 HTTPS 预览；不改应用代码").add_subparsers(dest="action", required=True)
-    up = preview.add_parser("up", help="配置两个映射、frpc 与 Caddy；默认只预演")
+    up = preview.add_parser("up", help="配置预览映射、frpc 与 Caddy（443 用单个 HTTPS 映射，其他公网端口用 HTTP 挑战和 TCP 映射）；默认只预演")
     up.add_argument("name")
     up.add_argument("--tunnel", required=True)
     up.add_argument("--local-port", type=int, required=True)
@@ -159,20 +159,27 @@ def plan(device: str, protocol: str, apps: int) -> dict:
     if device == "other":
         return dict(base, mode="independent", reason="不同设备必须使用独立隧道与独立 frpc 身份，不要复用当前设备的共享底座。", steps=[
             "在目标设备安装并验证 CLI：passnat auth check",
-            "需要 HTTPS 时在该设备单独执行 passnat preview up --tunnel NEW_TUNNEL_ID ... --apply；需要 HTTP 时执行 passnat tunnels create NAME --node-id NODE_ID --port-name PORT_NAME --protocol http --local-port PORT --subdomain SUB --domain-id DOMAIN_ID --apply",
+            "需要 HTTPS 时在该设备单独执行 passnat preview up NAME --tunnel NEW_TUNNEL_ID --local-port APP_HTTP_PORT --public-port 443 --domain-id DOMAIN_ID --subdomain SUB --apply；需要 HTTP 时执行 passnat tunnels create NAME --node-id NODE_ID --port-name PORT_NAME --protocol http --local-port APP_HTTP_PORT --subdomain SUB --domain-id DOMAIN_ID --apply",
             "如果该设备确实有多个 HTTPS 应用，也只在该设备单独 init 一个共享底座，不复用当前设备的",
         ], notes=["不要复制当前设备的 frpc 配置、隧道 ID 或进程身份。", "同一本机端口号不算冲突；归属按 port_name 判定。"])
     if protocol == "https":
         if apps >= 2:
             return dict(base, mode="shared_https", reuse_shared=True, reason="同一设备、多个 HTTPS 应用：复用一条隧道、一个 Caddy、一个 frpc。", steps=[
                 "首条映射指向 Caddy TLS 端口：passnat tunnels create NAME --node-id NODE_ID --port-name PORT_NAME --caddy-tls-port TLS_PORT --subdomain SUB --domain-id DOMAIN_ID --apply",
-                "初始化共享底座：passnat shared init NAME --tunnel TUNNEL_ID --apply",
-                "逐个登记应用：passnat shared site NAME APP --subdomain SUB --domain-id DOMAIN_ID --upstream-port PORT --apply",
-                "热重载：passnat shared sync NAME --reload --apply",
+                "初始化共享底座（--tls-port 与上一步一致）：passnat shared init NAME --tunnel TUNNEL_ID --tls-port TLS_PORT --apply",
+                "逐个登记应用：passnat shared site NAME APP --subdomain SUB --domain-id DOMAIN_ID --upstream-port APP_HTTP_PORT --apply",
+                # 首次运行 Caddy 尚未启动，必须先 sync 再启动 proxy，之后新增站点才热重载。
+                "首次写入并校验配置：passnat shared sync NAME --apply",
                 "先 passnat shared run NAME proxy，确认 TLS 端口监听后再 passnat shared run NAME frpc",
-            ], notes=["不要再为第二个应用创建第二条隧道或第二个 frpc。", "HTTP/TCP/UDP 不得进入这个 Caddy 共享流程。"])
+            ], notes=[
+                "不要再为第二个应用创建第二条隧道或第二个 frpc。",
+                "底座已在运行后再新增站点时，才使用 passnat shared sync NAME --reload --apply 热重载。",
+                "HTTP/TCP/UDP 不得进入这个 Caddy 共享流程。",
+            ])
         return dict(base, mode="single_https", reason="单设备只发布一个 HTTPS 应用：使用独立预览，不要自动套用共享复用。", steps=[
-            "passnat preview up NAME --tunnel TUNNEL_ID --local-port PORT --public-port PORT --domain-id DOMAIN_ID --subdomain SUB --apply",
+            "先创建专用隧道并对齐初始端口名：passnat tunnels create TUNNEL_NAME --node-id NODE_ID --port-name NAME-tcp --caddy-tls-port 443 --subdomain SUB --domain-id DOMAIN_ID --apply",
+            # local-port 是应用 HTTP 端口，public-port 是公网 HTTPS 端口，两者不能相同。
+            "passnat preview up NAME --tunnel TUNNEL_ID --local-port APP_HTTP_PORT --public-port 443 --domain-id DOMAIN_ID --subdomain SUB --apply",
             "先 passnat preview run NAME proxy，再 passnat preview run NAME frpc",
         ], notes=["preview 与 shared 不能同时占用公网 80/443。", "不要因为本机还有别的应用就顺手建共享底座。"])
     if protocol == "http":
@@ -209,6 +216,10 @@ def dispatch(args):
         # 在任何凭证读取或网络请求之前拒绝误用。
         require_supported_protocol(args.protocol)
         require_local_tls(args.protocol, args.local_tls)
+        if args.protocol in ("http", "https") and args.remote_port is not None:
+            expected_remote = 80 if args.protocol == "http" else 443
+            if args.remote_port != expected_remote:
+                raise Failure("conflicting_mapping_options", f"{args.protocol.upper()} 映射固定使用远端端口 {expected_remote}，不能指定 --remote-port {args.remote_port}。", 3)
     create_spec = resolve_create_spec(args) if (resource, action) == ("tunnels", "create") else None
     if resource == "plan":
         return plan(args.device, args.protocol, args.apps)
