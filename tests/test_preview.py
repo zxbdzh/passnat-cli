@@ -6,6 +6,7 @@ import tarfile
 import tempfile
 import unittest
 import zipfile
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
@@ -120,7 +121,8 @@ class FindFrpcTests(unittest.TestCase):
         self.assertEqual(found.exception.code, "frpc_missing")
         self.assertEqual(found.exception.exit_code, 3)
         message = str(found.exception)
-        self.assertIn(str(SYSTEM_FRPC), message)
+        # 报错固定提示 macOS 正斜杠路径，避免在 Windows 上因反斜杠导致断言失真。
+        self.assertIn(SYSTEM_FRPC.as_posix(), message)
         self.assertIn(USER_FRPC_TEXT, message)
 
     def test_non_executable_bundle_binary_is_rejected(self):
@@ -196,8 +198,11 @@ class FindCaddyTests(unittest.TestCase):
 
     def test_macos_rejects_non_executable_managed_binary(self):
         self.executable("home/bin/caddy", mode=0o644)
+        # Windows 下 chmod(0o644) 不清除执行位，需要显式模拟 os.access 返回 False。
+        no_exec = patch("passnat.preview.os.access", return_value=False) if os.name == "nt" else nullcontext()
         with patch.dict(os.environ, {"PASSNAT_HOME": str(self.home), "PASSNAT_CADDY": ""}), \
-             patch("passnat.preview._caddy_platform", return_value="macos"):
+             patch("passnat.preview._caddy_platform", return_value="macos"), \
+             no_exec:
             with self.assertRaises(Failure) as found:
                 find_caddy()
         self.assertEqual(found.exception.code, "caddy_missing")
@@ -237,9 +242,11 @@ class FindCaddyTests(unittest.TestCase):
 
     def test_non_executable_candidate_is_rejected(self):
         blocked = self.executable("home/bin/caddy", mode=0o644)
+        no_exec = patch("passnat.preview.os.access", return_value=False) if os.name == "nt" else nullcontext()
         with patch.dict(os.environ, {"PASSNAT_HOME": str(self.home), "PASSNAT_CADDY": str(blocked)}), \
              patch("passnat.preview._caddy_platform", return_value="unsupported"), \
-             patch("passnat.preview.shutil.which", return_value=None):
+             patch("passnat.preview.shutil.which", return_value=None), \
+             no_exec:
             with self.assertRaises(Failure) as found:
                 find_caddy()
         self.assertEqual(found.exception.code, "caddy_missing")
@@ -469,10 +476,16 @@ class InstallCaddyTests(unittest.TestCase):
         outside.write_bytes(b"mac-binary")
         target = self.home / "bin" / "caddy"
         target.parent.mkdir(parents=True)
-        target.symlink_to(outside)
+        try:
+            target.symlink_to(outside)
+            symlink_guard = nullcontext()
+        except OSError:
+            # Windows 非提权账号默认无 symlink 权限，改用定向 mock 覆盖符号链接拒绝分支。
+            symlink_guard = patch.object(Path, "is_symlink", autospec=True, side_effect=lambda path: path == target)
         with patch("passnat.preview._caddy_platform", return_value="macos"), \
              patch("passnat.preview.platform.machine", return_value="arm64"), \
-             patch("passnat.preview._fetch") as fetch:
+             patch("passnat.preview._fetch") as fetch, \
+             symlink_guard:
             with self.assertRaises(Failure) as found:
                 install_caddy()
         self.assertEqual(found.exception.code, "unsafe_path")
