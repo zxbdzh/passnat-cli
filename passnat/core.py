@@ -290,6 +290,8 @@ class Client:
             with self.opener.open(request, timeout=25) as response:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as error:
+            if error.code == 401:
+                raise Failure("authentication_failed", "PassNAT 认证失败（HTTP 401）。", 2) from None
             raise Failure("http_error", f"PassNAT 返回 HTTP {error.code}。") from None
         except (urllib.error.URLError, TimeoutError, OSError):
             raise Failure("network_error", "连接 PassNAT 失败；写请求可能已受理，请先对账，不要盲目重试。") from None
@@ -311,9 +313,14 @@ class Client:
         return payload.get("data")
 
     def reject(self, payload: dict):
-        message = str(payload.get("msg", "PassNAT 请求失败。")).replace(self.key, "[REDACTED]")[:200]
+        message = str(payload.get("msg", "PassNAT 请求失败。"))
         code = payload.get("code")
-        raise Failure("authentication_failed" if code in (30001, 30002, 30003) else "api_error", f"{message}（业务码 {code}）", 2 if code in (30001, 30002, 30003) else 1)
+        # 仅原样输出预期的整数业务码，避免异常响应借 code 字段回显密钥。
+        safe_code = code if isinstance(code, int) and not isinstance(code, bool) else "异常"
+        if self.key:
+            message = message.replace(self.key, "[REDACTED]")
+        auth_failed = safe_code in (30001, 30002, 30003)
+        raise Failure("authentication_failed" if auth_failed else "api_error", f"{message[:200]}（业务码 {safe_code}）", 2 if auth_failed else 1)
 
     def tunnel(self, tunnel_id: str) -> dict:
         data = self.request("/user/tunnel/detail?" + urllib.parse.urlencode({"tunnel_id": tunnel_id}))
@@ -338,6 +345,9 @@ def marker(tunnel: str, name: str) -> str:
 def matches(row: dict, spec: dict) -> bool:
     fields = ("local_ip", "local_port", "protocol", "remote_port", "remark")
     if not all(row.get(field) == spec.get(field) for field in fields):
+        return False
+    # 当远端同时返回 domain_id 时一并核对，防止同名子域挂在错误主域名下被误复用。
+    if spec.get("domain_id") is not None and row.get("domain_id") is not None and row.get("domain_id") != spec["domain_id"]:
         return False
     return not spec.get("sub_domain") or str(row.get("domain", "")).startswith(spec["sub_domain"] + ".")
 
@@ -432,8 +442,17 @@ def _reuse_created(client: Client, name: str, node_id: int, port_name: str, spec
     if len(found) != 1:
         raise Failure("reconciliation_required", "已登记隧道中无法唯一确认初始映射；记录已保留，请先在平台核对，不会自动创建或删除。")
     port_state = load_state(port_name)
-    if port_state and (port_state.get("tunnel_id") != tunnel_id or port_state.get("spec") != recorded or port_state.get("port_id") not in (None, found[0]["id"])):
-        raise Failure("state_conflict", "本地初始端口记录与远端映射不一致，拒绝复用。", 3)
+    if port_state:
+        if port_state.get("status") in ("creating", "uncertain"):
+            raise Failure("reconciliation_required", "本地初始端口记录待对账，请先核对平台后再复用。")
+        if (
+            port_state.get("status") != "active"
+            or port_state.get("tunnel_id") != tunnel_id
+            or port_state.get("spec") != recorded
+            or port_state.get("port_id") not in (None, found[0]["id"])
+            or port_state.get("proxy_name") not in (None, found[0].get("proxy_name"))
+        ):
+            raise Failure("state_conflict", "本地初始端口记录与远端映射不一致，拒绝复用。", 3)
     # 远端隧道详情只提供 node_info（端口范围/地址），没有 node_id；节点只能按本地记录核对。
     return {"reused": True, "tunnel_id": tunnel_id, "name": name, "node_id": record["node_id"], "initial_port": found[0]}
 
@@ -478,8 +497,12 @@ def create_tunnel(client: Client, name: str, node_id: int, port_name: str, spec:
         save_state(name, record, "create-")
         raise error or Failure("reconciliation_required", "新隧道创建结果无法唯一确认，已保留对账记录。")
     item = created[0]
+    # 一旦唯一识别出新隧道就先落盘 tunnel_id，避免后续初始端口校验失败导致记录停在无 ID 状态。
+    record["tunnel_id"] = item["tunnel_id"]
     ports = [row for row in item["proxy_info"] if matches(row, spec)]
     if len(ports) != 1:
+        record["status"] = "uncertain"
+        save_state(name, record, "create-")
         raise Failure("reconciliation_required", "新隧道初始端口参数与请求不一致。")
     row = ports[0]
     save_state(port_name, {"tunnel_id": item["tunnel_id"], "spec": spec, "before_ids": [], "status": "active", "port_id": row["id"], "proxy_name": row["proxy_name"]})
@@ -507,6 +530,13 @@ def delete_port(client: Client, name: str, apply: bool) -> dict:
     return {"removed": True, "port_id": state["port_id"]}
 
 
+def _check_safe_proxy(proxy: dict) -> None:
+    if proxy.get("plugin") or proxy.get("type") not in ("http", "https", "tcp"):
+        raise Failure("unsafe_proxy", "仅允许直接 HTTP/HTTPS/TCP 代理，不执行配置中的插件。", 3)
+    if proxy.get("localIP") not in ("127.0.0.1", "localhost", "::1"):
+        raise Failure("unsafe_proxy", "预览代理必须指向本机回环地址。", 3)
+
+
 def filtered_config(raw: str, names: set[str]) -> str:
     try:
         parsed = tomllib.loads(raw)
@@ -514,19 +544,35 @@ def filtered_config(raw: str, names: set[str]) -> str:
         raise Failure("invalid_config", "平台返回的配置不是有效 TOML。") from None
     if parsed.get("includes") or parsed.get("visitors") or parsed.get("start"):
         raise Failure("unsafe_config", "配置含额外 include、visitor 或启动选择，拒绝自动运行。", 3)
-    blocks = re.split(r"(?m)^\s*\[\[proxies\]\]\s*$", raw)
+    # 先对完整 TOML 解析结果校验目标代理，防止表头注释或格式差异绕过块分割。
+    for proxy in parsed.get("proxies", []):
+        if proxy.get("name") in names:
+            _check_safe_proxy(proxy)
+    blocks = re.split(r"(?m)^[ \t]*\[\[[ \t]*proxies[ \t]*\]\][ \t]*(?:#[^\r\n]*)?$", raw)
+    try:
+        head = tomllib.loads(blocks[0])
+    except tomllib.TOMLDecodeError:
+        raise Failure("invalid_config", "平台配置代理段格式无法安全过滤。") from None
+    if head.get("proxies"):
+        raise Failure("invalid_config", "平台配置代理段格式无法安全过滤。")
     selected = []
     for block in blocks[1:]:
-        proxy = tomllib.loads("[[proxies]]\n" + block)["proxies"][0]
+        try:
+            proxy = tomllib.loads("[[proxies]]\n" + block)["proxies"][0]
+        except (tomllib.TOMLDecodeError, KeyError, IndexError):
+            raise Failure("invalid_config", "平台配置代理段格式无法安全过滤。") from None
         if proxy.get("name") in names:
-            if proxy.get("plugin") or proxy.get("type") not in ("http", "https", "tcp"):
-                raise Failure("unsafe_proxy", "仅允许直接 HTTP/HTTPS/TCP 代理，不执行配置中的插件。", 3)
-            if proxy.get("localIP") not in ("127.0.0.1", "localhost", "::1"):
-                raise Failure("unsafe_proxy", "预览代理必须指向本机回环地址。", 3)
+            _check_safe_proxy(proxy)
             selected.append("[[proxies]]\n" + block.strip() + "\n")
     result = blocks[0].rstrip() + "\n\n" + "\n".join(selected)
-    actual = {row["name"] for row in tomllib.loads(result).get("proxies", [])}
-    if actual != names:
+    try:
+        output_proxies = tomllib.loads(result).get("proxies", [])
+    except tomllib.TOMLDecodeError:
+        raise Failure("invalid_config", "过滤后的配置不是有效 TOML。") from None
+    for proxy in output_proxies:
+        _check_safe_proxy(proxy)
+    actual = {row["name"] for row in output_proxies}
+    if len(output_proxies) != len(names) or actual != names:
         raise Failure("proxy_not_found", "平台配置尚未包含全部指定代理。")
     return result
 

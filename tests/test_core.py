@@ -1,4 +1,5 @@
 import copy
+import ctypes
 import io
 import json
 import os
@@ -9,7 +10,8 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
-from passnat.core import Client, Failure, NoRedirect, add_port, create_tunnel, credential, delete_port, filtered_config, keychain_load, keychain_store, load_state, load_stored_credential, marker, mutation_lock, owned_path, redact, save_credential, save_state, write_private
+import passnat.core as core
+from passnat.core import Client, Failure, NoRedirect, add_port, create_tunnel, credential, delete_port, filtered_config, keychain_load, keychain_store, load_state, load_stored_credential, marker, matches, mutation_lock, owned_path, redact, save_credential, save_state, write_private
 from passnat.preview import caddyfile, down, run, up
 
 
@@ -375,6 +377,42 @@ class CreateTunnelTests(unittest.TestCase):
         self.assertEqual(load_state("demo-tcp")["spec"], self.spec)
         self.assertEqual(load_state("demo", "create-")["status"], "active")
 
+    def test_reuse_rejects_removed_or_uncertain_port_record(self):
+        for status, expected in (("removed", "state_conflict"), ("uncertain", "reconciliation_required")):
+            with self.subTest(status=status):
+                item, _ = self.registered()
+                port_state = load_state("demo-tcp")
+                port_state["status"] = status
+                save_state("demo-tcp", port_state)
+                client = CreateClient([item])
+                with self.assertRaises(Failure) as found:
+                    create_tunnel(client, "demo", 1, "demo-tcp", dict(self.SPEC), True)
+                self.assertEqual(found.exception.code, expected)
+
+    def test_apply_persists_tunnel_id_when_initial_port_mismatches(self):
+        client = CreateClient()
+        original_request = client.request
+
+        def request(path, method="GET", data=None, **kwargs):
+            result = original_request(path, method, data, **kwargs)
+            if path == "/user/tunnel/add":
+                client.tunnels[-1]["proxy_info"][0]["local_port"] = 9999
+            return result
+
+        client.request = request
+        with self.assertRaises(Failure) as found:
+            create_tunnel(client, "demo", 1, "demo-tcp", dict(self.SPEC), True)
+        self.assertEqual(found.exception.code, "reconciliation_required")
+        saved = load_state("demo", "create-")
+        self.assertEqual(saved["tunnel_id"], "T-new")
+        self.assertEqual(saved["status"], "uncertain")
+
+    def test_matches_rejects_mismatched_domain_id(self):
+        row = dict(self.spec, domain="demo.example.com", domain_id=99)
+        self.assertFalse(matches(row, self.spec))
+        self.assertTrue(matches(dict(row, domain_id=7), self.spec))
+        self.assertTrue(matches(dict(self.spec, domain="demo.example.com"), self.spec))
+
 
 class ConfigTests(unittest.TestCase):
     CONFIG = '''serverAddr = "8.8.8.8"
@@ -450,6 +488,53 @@ customDomains = ["test.example.com"]
         self.assertIn("disable_http_challenge", config)
         self.assertNotIn("disable_tlsalpn_challenge", config)
         self.assertIn("flush_interval -1", config)
+
+    def test_non_443_caddyfile_uses_http_challenge_and_redirect(self):
+        config = caddyfile({"admin_port": 54214, "challenge_port": 18280, "public_port": 18443, "domain": "test.example.com", "local_port": 3214})
+        self.assertIn("disable_tlsalpn_challenge", config)
+        self.assertNotIn("disable_http_challenge", config)
+        self.assertIn("https://test.example.com:18443", config)
+        self.assertIn("redir https://test.example.com:18443{uri} 308", config)
+
+    def test_non_443_preview_up_dry_run_plans_http_and_tcp(self):
+        client = FakeClient()
+        result = up(client, "sample", "test", 8000, 18443, 18280, 54214, 3, "test", None, False)
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["preview"]["url"], "https://test.example.com:18443/")
+        self.assertEqual(result["http"]["request"]["port_relation"][0]["remote_port"], 80)
+        self.assertEqual(result["tcp"]["request"]["port_relation"][0]["protocol"], "tcp")
+        self.assertEqual(result["tcp"]["request"]["port_relation"][0]["remote_port"], 18443)
+
+    def test_http_401_is_mapped_to_authentication_failed(self):
+        client = Client("test-key")
+        def fail(*args, **kwargs):
+            raise urllib.error.HTTPError("https://api.passnat.com/user/userInfo", 401, "Unauthorized", {}, None)
+        client.opener.open = fail
+        with self.assertRaises(Failure) as found:
+            client.request("/user/userInfo")
+        self.assertEqual(found.exception.code, "authentication_failed")
+        self.assertEqual(found.exception.exit_code, 2)
+
+    def test_reject_redacts_secret_even_when_code_field_contains_secret(self):
+        client = Client("test-key")
+        client.opener.open = lambda *args, **kwargs: io.BytesIO(b'{"code":"test-key","msg":"denied test-key"}')
+        with self.assertRaises(Failure) as found:
+            client.request("/user/userInfo")
+        self.assertEqual(found.exception.code, "api_error")
+        self.assertEqual(found.exception.exit_code, 1)
+        self.assertNotIn("test-key", str(found.exception))
+
+    def test_filtered_config_handles_commented_proxy_header_and_blocks_unsafe_proxy(self):
+        valid = self.CONFIG.replace('[[proxies]]\nname = "preview"', '[[proxies]] # inline comment\nname = "preview"')
+        parsed = tomllib.loads(filtered_config(valid, {"preview"}))
+        self.assertEqual([row["name"] for row in parsed["proxies"]], ["preview"])
+        for unsafe in (
+            valid.replace('localIP = "127.0.0.1"\nlocalPort = 443', 'localIP = "10.0.0.5"\nlocalPort = 443'),
+            valid + '\n[proxies.plugin]\ntype = "static_file"\n',
+        ):
+            with self.assertRaises(Failure) as found:
+                filtered_config(unsafe, {"preview"})
+            self.assertEqual(found.exception.code, "unsafe_proxy")
 
 
 class CredentialTests(unittest.TestCase):
@@ -558,6 +643,76 @@ class KeychainTests(unittest.TestCase):
                 keychain_load()
         self.assertEqual(found.exception.code, "credential_error")
         self.assertNotIn("STORED-KEY", str(found.exception))
+
+    def test_ctypes_security_framework_wiring_and_release(self):
+        stored = ctypes.create_string_buffer(b"MEM-SECRET", len(b"MEM-SECRET"))
+        released = []
+        freed = []
+        added_payloads = []
+
+        class FakeFunc:
+            def __init__(self, handler):
+                self.handler = handler
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                return self.handler(*args)
+
+        def _ptr_out(pointer_arg, value):
+            # 写入调用方传入的 ctypes.byref(c_void_p/c_uint32) 内存槽，模拟原生 C 输出参数。
+            ctypes.cast(pointer_arg, ctypes.POINTER(ctypes.c_void_p))[0] = value
+
+        class FakeSecurity:
+            def __init__(self):
+                def add(_kc, _slen, _s, _alen, _a, length, data_ptr, item_out):
+                    added_payloads.append(ctypes.string_at(data_ptr, length))
+                    _ptr_out(item_out, 0x1001)
+                    return 0
+
+                def find(_kc, _slen, _s, _alen, _a, length_out, data_out, item_out):
+                    ctypes.cast(length_out, ctypes.POINTER(ctypes.c_uint32))[0] = len(b"MEM-SECRET")
+                    _ptr_out(data_out, ctypes.cast(stored, ctypes.c_void_p).value)
+                    _ptr_out(item_out, 0x1002)
+                    return 0
+
+                def modify(_item, _attr, _length, _data):
+                    return 0
+
+                def free_content(_attr, data_ptr):
+                    freed.append(data_ptr)
+                    return 0
+
+                self.SecKeychainAddGenericPassword = FakeFunc(add)
+                self.SecKeychainFindGenericPassword = FakeFunc(find)
+                self.SecKeychainItemModifyAttributesAndData = FakeFunc(modify)
+                self.SecKeychainItemFreeContent = FakeFunc(free_content)
+
+        class FakeCoreFoundation:
+            def __init__(self):
+                def release(item_ptr):
+                    released.append(item_ptr.value)
+
+                self.CFRelease = FakeFunc(release)
+
+        fake_sec = FakeSecurity()
+        fake_cf = FakeCoreFoundation()
+
+        def cdll(name):
+            return fake_sec if "Security" in str(name) else fake_cf
+
+        try:
+            core._framework = None
+            with patch("passnat.core.ctypes.util.find_library", side_effect=lambda name: f"/fake/{name}"), \
+                 patch("passnat.core.ctypes.CDLL", side_effect=cdll):
+                keychain_store("MEM-SECRET")
+                self.assertEqual(keychain_load(), "MEM-SECRET")
+        finally:
+            core._framework = None
+
+        self.assertEqual(added_payloads, [b"MEM-SECRET"])
+        self.assertEqual(len(freed), 1)
+        self.assertEqual(released, [0x1001, 0x1002])
 
 
 if __name__ == "__main__":
