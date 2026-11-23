@@ -10,13 +10,14 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import tomllib
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 from .core import Client, Failure, ensure_home, filtered_config, load_state, matches, mutation_lock, owned_path, port_number, save_state, write_private, add_port
-from .preview import find_frpc
+from .preview import find_caddy, find_frpc
 
 
 def state_for(name):
@@ -61,9 +62,7 @@ def init(client, name, tunnel_id, tls_port, admin_port, challenge_port, apply):
     state.setdefault('sites', {})
     state.setdefault('frpc_admin_password', secrets.token_urlsafe(32))
     state['frpc'] = find_frpc()
-    state['caddy'] = str(ensure_home() / 'bin/caddy.exe')
-    if not Path(state['caddy']).is_file():
-        raise Failure('caddy_missing', '请先安装 Caddy。', 3)
+    state['caddy'] = find_caddy()
     save_state(name, state, 'shared-')
     return dict(configured=True, name=name, site_count=len(state['sites']))
 
@@ -120,16 +119,17 @@ def config_paths(name):
 
 def caddy_config(state):
     storage = (ensure_home() / ('shared-' + state['name'] + '-certs')).as_posix()
-    lines = ['{', f'    admin 127.0.0.1:{state["admin_port"]}', f'    http_port {state["challenge_port"]}', f'    https_port {state["tls_port"]}', '    auto_https disable_redirects', '    storage file_system {', f'        root {json.dumps(storage)}', '    }', '}', '']
+    # 路径使用 ensure_ascii=False，避免 Caddyfile 把非 ASCII 目录名当成字面量 \uXXXX。
+    lines = ['{', f'    admin 127.0.0.1:{state["admin_port"]}', f'    http_port {state["challenge_port"]}', f'    https_port {state["tls_port"]}', '    auto_https disable_redirects', '    storage file_system {', f'        root {json.dumps(storage, ensure_ascii=False)}', '    }', '}', '']
     for site in state['sites'].values():
         if site.get('status') != 'active':
             continue
         lines += [f'https://{site["domain"]} {{', '    bind 127.0.0.1', '    tls {', '        issuer acme {', '            disable_http_challenge', '        }', '    }', '    header X-Robots-Tag "noindex, nofollow, noarchive"']
         if 'upstream_port' in site:
-            lines += [f'    reverse_proxy http://localhost:{site["upstream_port"]} {{', '        flush_interval -1', '        header_down Set-Cookie "^(.*)$" "$1; Secure"', '    }']
+            lines += [f'    reverse_proxy http://127.0.0.1:{site["upstream_port"]} {{', '        flush_interval -1', '        header_down Set-Cookie "^(.*)$" "$1; Secure"', '    }']
         else:
             paths = ['/'] + ['/' + filename for filename in site['files']]
-            lines += ['    @published {', '        method GET HEAD', '        path ' + ' '.join(paths), '    }', '    handle @published {', f'        root * {json.dumps(Path(site["root"]).as_posix())}', '        file_server', '    }', '    handle {', '        respond 404', '    }']
+            lines += ['    @published {', '        method GET HEAD', '        path ' + ' '.join(paths), '    }', '    handle @published {', f'        root * {json.dumps(Path(site["root"]).as_posix(), ensure_ascii=False)}', '        file_server', '    }', '    handle {', '        respond 404', '    }']
         lines += ['}', '']
     return chr(10).join(lines)
 
@@ -160,14 +160,33 @@ def sync(client, name, apply, reload=False):
         raise Failure('unsafe_config', '平台配置已含管理接口，拒绝覆盖。', 3)
     common, proxies = raw.split('[[proxies]]', 1)
     frpc = chr(10).join([common.rstrip(), '', '[webServer]', 'addr = "127.0.0.1"', f'port = {state["admin_port"] + 1}', 'user = "shared"', f'password = {json.dumps(state["frpc_admin_password"])}', '', '[[proxies]]' + proxies])
+    caddy_text = caddy_config(state)
     caddy_path, frpc_path = config_paths(name)
+    # 先对临时候选配置执行 validate 与 verify，全部通过后再备份 .previous 并替换正式文件，
+    # 避免校验失败污染正式配置或重复失败时把最后有效备份覆盖成坏配置。
+    tmp_files = []
+    try:
+        for suffix, content in (('.Caddyfile', caddy_text), ('.frpc.toml', frpc)):
+            handle, tmp_name = tempfile.mkstemp(prefix='.validate-', suffix=suffix, dir=caddy_path.parent)
+            tmp_path = Path(tmp_name)
+            tmp_files.append(tmp_path)
+            with os.fdopen(handle, 'wb') as stream:
+                stream.write(content.encode('utf-8'))
+        tmp_caddy, tmp_frpc = tmp_files
+        checked([state['caddy'], 'validate', '--config', str(tmp_caddy), '--adapter', 'caddyfile'])
+        checked([state['frpc'], 'verify', '-c', str(tmp_frpc)])
+    finally:
+        for tmp_path in tmp_files:
+            # 临时校验文件清理失败不应覆盖前面 checked() 抛出的主要校验错误。
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
     for path in (caddy_path, frpc_path):
         if path.exists():
             write_private(path.with_suffix(path.suffix + '.previous'), path.read_bytes())
-    write_private(caddy_path, caddy_config(state))
+    write_private(caddy_path, caddy_text)
     write_private(frpc_path, frpc)
-    checked([state['caddy'], 'validate', '--config', str(caddy_path), '--adapter', 'caddyfile'])
-    checked([state['frpc'], 'verify', '-c', str(frpc_path)])
     if reload:
         # 只访问回环管理接口，核对实例归属后才允许热重载。
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))

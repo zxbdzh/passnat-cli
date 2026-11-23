@@ -2,58 +2,234 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import io
 import ipaddress
 import json
 import os
+import platform
 import shutil
 import ssl
 import socket
 import subprocess
 import sys
+import tarfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
 
 from .core import Client, Failure, add_port, delete_port, ensure_home, filtered_config, load_state, matches, mutation_lock, owned_path, save_state, write_private
 
-CADDY_VERSION = "2.11.7"
-CADDY_ASSET = f"caddy_{CADDY_VERSION}_windows_amd64.zip"
+CADDY_VERSION = "2.11.9"
 CADDY_RELEASE = f"https://github.com/caddyserver/caddy/releases/download/v{CADDY_VERSION}/"
+CADDY_WINDOWS_ASSET = f"caddy_{CADDY_VERSION}_windows_amd64.zip"
+CADDY_MACOS_ASSET = f"caddy_{CADDY_VERSION}_mac_arm64.tar.gz"
+# 官方 GitHub Release 资产固定摘要；只接受这一个版本，避免静默升级到未验证的构建。
+# 注意这是 tar.gz 归档本身的摘要，不是解压后 caddy 二进制的摘要。
+CADDY_MACOS_ARCHIVE_SHA256 = "d075afc620376679a77b453399bf7ada264cab3280b2833e4ed1372abc0c1c13"
+# 安装成功后记录解压出的二进制摘要；重复运行时据此确认受管文件仍来自同一份已验证归档。
+CADDY_INSTALL_RECORD = "caddy.install.json"
+
+
+def _macos_app_bundles() -> list[Path]:
+    # PassNAT 桌面客户端自带 frpc，放在 .app 包内，不在 PATH 上。
+    if sys.platform != "darwin":
+        return []
+    return [
+        Path("/Applications/PassNAT.app/Contents/MacOS/frpc"),
+        Path.home() / "Applications/PassNAT.app/Contents/MacOS/frpc",
+    ]
+
+
+def _executable(candidate: str | Path) -> bool:
+    path = Path(candidate)
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def _frpc_missing() -> Failure:
+    if sys.platform == "darwin":
+        message = (
+            "未找到可执行的 frpc。请设置 PASSNAT_FRPC、通过 --frpc 指定，或安装 PassNAT.app"
+            "（/Applications/PassNAT.app/Contents/MacOS/frpc 或 ~/Applications/PassNAT.app/Contents/MacOS/frpc）。"
+        )
+    else:
+        message = "请设置 PASSNAT_FRPC、通过 --frpc 指定，或将 frpc 放入 PATH。"
+    return Failure("frpc_missing", message, 3)
 
 
 def find_frpc(explicit: str | None = None) -> str:
-    candidates = [explicit, os.environ.get("PASSNAT_FRPC"), shutil.which("frpc")]
+    candidates: list[str | Path | None] = [
+        explicit,
+        os.environ.get("PASSNAT_FRPC"),
+        shutil.which("frpc"),
+    ]
+    candidates.extend(_macos_app_bundles())
     for candidate in candidates:
-        if candidate and Path(candidate).is_file():
+        if candidate and _executable(candidate):
             return str(Path(candidate).resolve())
-    raise Failure("frpc_missing", "请设置 PASSNAT_FRPC 或通过 --frpc 指定原版 frpc 程序。", 3)
+    raise _frpc_missing()
+
+
+def _caddy_platform() -> str:
+    if os.name == "nt":
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    return "unsupported"
+
+
+def _caddy_missing() -> Failure:
+    if _caddy_platform() == "macos":
+        # macOS 固定使用受管官方二进制，不回退到 Homebrew 或 PATH 中版本不明的 caddy。
+        message = "未找到受管的 Caddy。请运行 passnat tools install-caddy 安装官方 v2.11.9（仅支持 Apple Silicon）；macOS 不使用 Homebrew 或 PATH 中的 caddy。"
+    elif os.name == "nt":
+        message = "未找到可执行的 Caddy。请运行 passnat tools install-caddy，或设置 PASSNAT_CADDY、将 caddy 放入 PATH。"
+    else:
+        # App 包只自带 frpc，没有 Caddy，不能承诺应用包自动发现。
+        message = "未找到可执行的 Caddy。请设置 PASSNAT_CADDY、将 caddy 放入 PATH，或运行 passnat tools install-caddy（仅支持 Windows amd64 与 macOS Apple Silicon）。"
+    return Failure("caddy_missing", message, 3)
+
+
+def find_caddy() -> str:
+    # 独立预览与共享网关共用同一解析顺序，避免错误提示与实际启动各说各话。
+    bin_dir = ensure_home() / "bin"
+    if _caddy_platform() == "macos":
+        managed = bin_dir / "caddy"
+        if not managed.is_symlink() and not managed.exists():
+            raise _caddy_missing()
+        if not managed.is_symlink() and managed.is_file() and not os.access(managed, os.X_OK):
+            raise _caddy_missing()
+        # 实际解析同样复用普通文件、安装记录与 SHA-256 核验，与安装阶段保持同一信任边界。
+        _existing_caddy(managed, "macos")
+        return str(managed.resolve())
+    candidates: list[str | Path | None] = [
+        os.environ.get("PASSNAT_CADDY"),
+        bin_dir / "caddy.exe",
+        bin_dir / "caddy",
+        shutil.which("caddy"),
+    ]
+    for candidate in candidates:
+        if candidate and _executable(candidate):
+            return str(Path(candidate).resolve())
+    raise _caddy_missing()
+
+
+def _fetch(url: str, timeout: int) -> bytes:
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        return response.read()
+
+
+def _zip_member(data: bytes, name: str) -> bytes:
+    # 只读取指定常规文件，不做通用解压，避免归档内其他成员被写到磁盘。
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        member = archive.getinfo(name)
+        if member.is_dir() or Path(member.filename).name != name:
+            raise Failure("unsafe_archive", "Caddy 归档成员不是预期的常规文件。", 3)
+        return archive.read(member)
+
+
+def _tar_member(data: bytes, name: str) -> bytes:
+    # tar 包只提取 caddy 一个常规文件；符号链接、硬链接和目录一律拒绝。
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+        member = archive.getmember(name)
+        if not member.isfile() or Path(member.name).name != name:
+            raise Failure("unsafe_archive", "Caddy 归档成员不是预期的常规文件。", 3)
+        stream = archive.extractfile(member)
+        if stream is None:
+            raise Failure("unsafe_archive", "无法读取 Caddy 归档成员。", 3)
+        return stream.read()
+
+
+def _install_record_path(target: Path) -> Path:
+    return target.parent / CADDY_INSTALL_RECORD
+
+
+def _load_install_record(target: Path) -> dict | None:
+    # 记录文件同样只接受本工具写入的常规文件；损坏或缺失都视为来源不明。
+    record = _install_record_path(target)
+    if record.is_symlink() or not record.is_file():
+        return None
+    try:
+        data = json.loads(record.read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_install_record(target: Path, binary: bytes) -> None:
+    record = {
+        "version": CADDY_VERSION,
+        "asset": CADDY_MACOS_ASSET,
+        "archive_sha256": CADDY_MACOS_ARCHIVE_SHA256,
+        "binary_sha256": hashlib.sha256(binary).hexdigest(),
+    }
+    write_private(_install_record_path(target), json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+
+
+def _existing_caddy(target: Path, system: str) -> dict:
+    if target.is_symlink() or not target.is_file():
+        raise Failure("unsafe_path", "托管路径已存在且不是普通文件，拒绝覆盖。", 3)
+    if system == "macos":
+        # 归档摘要与二进制摘要不同，必须依赖安装记录比对，不能拿归档摘要直接校验二进制。
+        record = _load_install_record(target)
+        if (
+            not record
+            or record.get("version") != CADDY_VERSION
+            or record.get("asset") != CADDY_MACOS_ASSET
+            or record.get("archive_sha256") != CADDY_MACOS_ARCHIVE_SHA256
+        ):
+            raise Failure("unexpected_file", "托管路径已有无法确认来源的文件，未覆盖；请先确认并手动移除。", 3)
+        if hashlib.sha256(target.read_bytes()).hexdigest() != record.get("binary_sha256"):
+            raise Failure("unexpected_file", "托管路径文件与安装记录不一致，未覆盖；请先确认并手动移除。", 3)
+        os.chmod(target, 0o700)
+        return {"installed": True, "path": str(target), "version": CADDY_VERSION, "reused": True, "checksum_verified": True, "checksum_algorithm": "sha256"}
+    if not os.access(target, os.X_OK):
+        raise Failure("unsafe_path", "托管路径已有不可执行文件，拒绝覆盖。", 3)
+    return {"installed": True, "path": str(target), "reused": True}
 
 
 def install_caddy() -> dict:
-    if os.name != "nt":
-        raise Failure("unsupported_platform", "当前自动安装只支持 Windows amd64，其他平台请设置 PASSNAT_CADDY。", 3)
+    system = _caddy_platform()
+    if system == "macos" and platform.machine() != "arm64":
+        raise Failure("unsupported_platform", "macOS 自动安装仅支持 Apple Silicon（arm64）；Intel Mac 请使用官方 Caddy 二进制并显式管理，本工具不提供 Homebrew 或 PATH 回退。", 3)
+    if system == "unsupported":
+        raise Failure("unsupported_platform", "自动安装仅支持 Windows amd64 与 macOS Apple Silicon（arm64）。", 3)
     root = ensure_home() / "bin"
-    root.mkdir(exist_ok=True)
-    target = root / "caddy.exe"
-    if target.exists():
-        return {"installed": True, "path": str(target), "reused": True}
     try:
-        with urllib.request.urlopen(CADDY_RELEASE + f"caddy_{CADDY_VERSION}_checksums.txt", timeout=40) as response:
-            checksums = response.read().decode("utf-8")
-        expected = next(line.split()[0] for line in checksums.splitlines() if line.split()[-1] == CADDY_ASSET)
-        with urllib.request.urlopen(CADDY_RELEASE + CADDY_ASSET, timeout=90) as response:
-            data = response.read()
-        algorithm = hashlib.sha512 if len(expected) == 128 else hashlib.sha256
-        if algorithm(data).hexdigest() != expected:
-            raise Failure("checksum_mismatch", "Caddy 下载文件校验失败。")
-        import io
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            binary = archive.read("caddy.exe")
+        root.mkdir(mode=0o700, exist_ok=True)
+    except OSError:
+        raise Failure("unsafe_path", "无法创建私有 bin 目录，拒绝继续。", 3) from None
+    if root.is_symlink() or not root.is_dir():
+        raise Failure("unsafe_path", "私有 bin 路径不是普通目录，拒绝写入。", 3)
+    filename = "caddy.exe" if system == "windows" else "caddy"
+    target = root / filename
+    if target.is_symlink() or target.exists():
+        return _existing_caddy(target, system)
+    try:
+        if system == "windows":
+            checksums = _fetch(CADDY_RELEASE + f"caddy_{CADDY_VERSION}_checksums.txt", 40).decode("utf-8")
+            expected = next(line.split()[0] for line in checksums.splitlines() if line.split() and line.split()[-1] == CADDY_WINDOWS_ASSET)
+            data = _fetch(CADDY_RELEASE + CADDY_WINDOWS_ASSET, 90)
+            algorithm = hashlib.sha512 if len(expected) == 128 else hashlib.sha256
+            if algorithm(data).hexdigest() != expected:
+                raise Failure("checksum_mismatch", "Caddy 下载文件校验失败。")
+            binary = _zip_member(data, "caddy.exe")
+        else:
+            data = _fetch(CADDY_RELEASE + CADDY_MACOS_ASSET, 90)
+            algorithm = hashlib.sha256
+            if algorithm(data).hexdigest() != CADDY_MACOS_ARCHIVE_SHA256:
+                raise Failure("checksum_mismatch", "Caddy 下载文件校验失败。")
+            binary = _tar_member(data, "caddy")
+            # 先写安装记录：即使随后进程中断，下次运行也只会重新下载，不会误用半成品。
+            _write_install_record(target, binary)
         write_private(target, binary)
-    except (urllib.error.URLError, OSError, StopIteration, zipfile.BadZipFile):
+        os.chmod(target, 0o700)
+    except Failure:
+        raise
+    except (urllib.error.URLError, TimeoutError, OSError, StopIteration, ValueError, tarfile.TarError, zipfile.BadZipFile, KeyError, EOFError):
         raise Failure("download_failed", "无法下载并校验 Caddy 官方发行包。") from None
-    return {"installed": True, "path": str(target), "version": CADDY_VERSION, "checksum_verified": True, "checksum_algorithm": algorithm().name}
+    return {"installed": True, "path": str(target), "version": CADDY_VERSION, "asset": CADDY_WINDOWS_ASSET if system == "windows" else CADDY_MACOS_ASSET, "checksum_verified": True, "checksum_algorithm": algorithm().name}
 
 
 def paths(name: str) -> tuple[Path, Path]:
@@ -76,7 +252,7 @@ https://{state["domain"]}:{state["public_port"]} {{
             {"disable_http_challenge" if state["public_port"] == 443 else "disable_tlsalpn_challenge"}
         }}
     }}
-    reverse_proxy http://localhost:{state["local_port"]} {{
+    reverse_proxy http://127.0.0.1:{state["local_port"]} {{
         flush_interval -1
         header_down Set-Cookie "^(.*)$" "$1; Secure"
     }}
@@ -124,9 +300,7 @@ def up(client: Client, name: str, tunnel_id: str, local_port: int, public_port: 
     if not apply:
         return {"dry_run": True, "preview": state, "http": add_port(client, name + "-http", tunnel_id, http_spec, False) if public_port != 443 else None, "tcp": add_port(client, name + "-tcp", tunnel_id, tcp_spec, False), "changes_application_source": False}
     state["frpc"] = find_frpc(frpc)
-    state["caddy"] = str(Path(os.environ.get("PASSNAT_CADDY") or ensure_home() / "bin/caddy.exe").resolve())
-    if not Path(state["caddy"]).is_file():
-        raise Failure("caddy_missing", "请先运行 passnat tools install-caddy，或设置 PASSNAT_CADDY。", 3)
+    state["caddy"] = find_caddy()
     # 记录每一步，部分成功时也能精确回收自己新增的端口，不误删隧道其他映射。
     state["status"] = "preparing"
     save_state(name, state, "preview-")
@@ -201,7 +375,9 @@ def _run(name: str, component: str) -> dict:
                     line = line.replace(secret, "[REDACTED]")
             sys.stderr.write(line)
         code = child.wait()
-        return {"stopped": True, "component": component, "exit_code": code}
+        if code:
+            raise Failure("runtime_exit", f"预览 {component} 退出码 {code}。")
+        return {"stopped": True, "component": component}
     except KeyboardInterrupt:
         child.terminate()
         try:
@@ -234,19 +410,62 @@ def status(name: str) -> dict:
     return result
 
 
+def _port_listening(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def _stop_preview_caddy(state: dict) -> None:
+    admin_port = state.get("admin_port")
+    if not admin_port:
+        return
+    # 回环管理接口必须绕过系统代理，核对唯一域名后才发送停止请求。
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    admin = f"http://127.0.0.1:{admin_port}"
+    try:
+        with opener.open(admin + "/config/", timeout=5) as response:
+            cfg = response.read().decode("utf-8")
+    except urllib.error.HTTPError as error:
+        raise Failure("runtime_command_failed", f"无法核对本地 Caddy 管理接口（HTTP {error.code}），未继续回收隧道。") from None
+    except urllib.error.URLError as error:
+        if isinstance(error.reason, ConnectionRefusedError):
+            return
+        raise Failure("runtime_command_failed", "检查本地 Caddy 管理接口失败，未继续回收隧道。") from None
+    except (TimeoutError, OSError):
+        raise Failure("runtime_command_failed", "检查本地 Caddy 管理接口超时，未继续回收隧道。") from None
+    if state["domain"] not in cfg:
+        raise Failure("process_conflict", "本地代理身份不匹配，未停止该进程。")
+    try:
+        with opener.open(urllib.request.Request(admin + "/stop", data=b"", method="POST"), timeout=5):
+            pass
+    except urllib.error.HTTPError as error:
+        raise Failure("runtime_command_failed", f"停止本地 Caddy 失败（HTTP {error.code}），未继续回收隧道。") from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise Failure("runtime_command_failed", "停止本地 Caddy 失败，未继续回收隧道。") from None
+
+
 def down(client: Client, name: str, apply: bool) -> dict:
     state = load_state(name, "preview-")
     if not state:
         raise Failure("not_found", "未找到该预览。", 3)
     live = client.tunnel(state["tunnel_id"])
-    if any(row.get("proxy_name") not in state.get("proxy_names", []) for row in live.get("proxy_info", [])):
-        raise Failure("shared_tunnel_refused", "隧道中出现其他映射，拒绝自动下线。", 3)
     # 代理名不等于归属：同名映射可能已被改作其他服务，停进程或删隧道前须核对完整登记。
     records = {}
     for suffix in ("http", "tcp"):
         item = load_state(name + "-" + suffix)
         if item and item.get("tunnel_id") == state["tunnel_id"] and item.get("status") == "active":
             records[item.get("port_id")] = item
+    # preparing 阶段部分创建成功后可能尚未落盘 proxy_names，此时依据本预览已激活端口记录核对归属。
+    known_names = state.get("proxy_names")
+    for row in live.get("proxy_info", []):
+        if known_names is not None:
+            if row.get("proxy_name") not in known_names:
+                raise Failure("shared_tunnel_refused", "隧道中出现其他映射，拒绝自动下线。", 3)
+        elif row.get("id") not in records:
+            raise Failure("shared_tunnel_refused", "隧道中出现其他映射，拒绝自动下线。", 3)
     for row in live.get("proxy_info", []):
         item = records.get(row.get("id"))
         if not item or row.get("proxy_name") != item.get("proxy_name") or not matches(row, item["spec"]):
@@ -263,9 +482,14 @@ def down(client: Client, name: str, apply: bool) -> dict:
     planned = {"dry_run": not apply, "name": name, "remove_owned_tunnel": state["tunnel_id"], "port_ids": [row["id"] for row in live.get("proxy_info", [])]}
     if not apply:
         return planned
-    # 先停止本工具独立 frpc，再回收本预览拥有的映射；不会停止桌面客户端。
+    # 先确认并停止本机运行的独立 frpc 与 Caddy，再回收远端专用隧道；不会停止桌面客户端。
     config, _ = paths(name)
-    subprocess.run([state["frpc"], "stop", "-c", str(config)], capture_output=True, timeout=15)
+    admin_port = state.get("admin_port")
+    if config.is_file() and state.get("frpc") and admin_port and _port_listening(admin_port + 1):
+        stopped = subprocess.run([state["frpc"], "stop", "-c", str(config)], capture_output=True, timeout=15)
+        if stopped.returncode:
+            raise Failure("runtime_command_failed", "停止预览 frpc 失败，未继续回收隧道。")
+    _stop_preview_caddy(state)
     client.request("/user/tunnel/del?" + urllib.parse.urlencode({"tid": state["tunnel_id"]}), "DELETE")
     remaining = client.request("/user/tunnel/list?page=1&size=100")
     if any(item["tunnel_id"] == state["tunnel_id"] for item in remaining):
@@ -278,17 +502,6 @@ def down(client: Client, name: str, apply: bool) -> dict:
         if port:
             port["status"] = "removed"
             save_state(name + "-" + suffix, port)
-    # Caddy 的管理接口只绑定回环；核对唯一域名后才允许关闭，避免端口重用误停其他实例。
-    admin = f'http://127.0.0.1:{state["admin_port"]}'
-    try:
-        with urllib.request.urlopen(admin + "/config/", timeout=5) as response:
-            cfg = response.read().decode("utf-8")
-        if state["domain"] not in cfg:
-            raise Failure("process_conflict", "本地代理身份不匹配，未停止该进程。")
-        with urllib.request.urlopen(urllib.request.Request(admin + "/stop", data=b"", method="POST"), timeout=5):
-            pass
-    except (urllib.error.URLError, TimeoutError, OSError):
-        pass
     state["status"] = "removed"
     save_state(name, state, "preview-")
     return {"removed": True, "name": name, "url": state["url"]}

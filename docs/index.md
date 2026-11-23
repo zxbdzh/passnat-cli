@@ -52,7 +52,7 @@ passnat shared status YOUR_SHARED_NAME
 ## 密钥留在本机
 
 - 仓库不提供 SecretKey、共享账号或真实运行配置。
-- Windows 可使用当前用户的 DPAPI 保存登录凭证；其他系统使用环境变量。
+- macOS 可使用系统钥匙串、Windows 可使用当前用户的 DPAPI 保存登录凭证；其他系统使用环境变量。
 - 运行配置、证书和状态记录保持私有，不能上传到公开仓库或本站。
 - 原应用的登录、权限、Cookie 和回调边界继续有效。
 
