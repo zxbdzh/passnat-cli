@@ -343,6 +343,14 @@ class PlanTests(unittest.TestCase):
         self.assertIn("独立隧道", result["reason"])
         self.assertNotIn("shared site", " ".join(result["steps"]))
 
+    def test_different_devices_tcp_and_http_emit_matching_protocol_steps(self):
+        tcp_steps = " ".join(dispatch(self.plan(device="other", protocol="tcp"))["steps"])
+        self.assertIn("--protocol tcp", tcp_steps)
+        self.assertNotIn("preview up", tcp_steps)
+        http_steps = " ".join(dispatch(self.plan(device="other", protocol="http"))["steps"])
+        self.assertIn("--protocol http", http_steps)
+        self.assertNotIn("preview up", http_steps)
+
     def test_udp_is_rejected_as_unsupported_everywhere(self):
         with patch("passnat.cli.Client") as client:
             with self.assertRaises(Failure) as found:

@@ -177,8 +177,11 @@ def sync(client, name, apply, reload=False):
         checked([state['frpc'], 'verify', '-c', str(tmp_frpc)])
     finally:
         for tmp_path in tmp_files:
-            if tmp_path.exists():
-                tmp_path.unlink()
+            # 临时校验文件清理失败不应覆盖前面 checked() 抛出的主要校验错误。
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
     for path in (caddy_path, frpc_path):
         if path.exists():
             write_private(path.with_suffix(path.suffix + '.previous'), path.read_bytes())

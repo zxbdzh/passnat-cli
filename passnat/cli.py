@@ -157,11 +157,24 @@ def plan(device: str, protocol: str, apps: int) -> dict:
         raise Failure("invalid_arguments", "--apps 至少为 1。", 3)
     base = dict(device=device, protocol=protocol, apps=apps, reuse_shared=False, local_only=True, credentials_read=False, network_accessed=False, state_written=False)
     if device == "other":
-        return dict(base, mode="independent", reason="不同设备必须使用独立隧道与独立 frpc 身份，不要复用当前设备的共享底座。", steps=[
-            "在目标设备安装并验证 CLI：passnat auth check",
-            "需要 HTTPS 时在该设备单独执行 passnat preview up NAME --tunnel NEW_TUNNEL_ID --local-port APP_HTTP_PORT --public-port 443 --domain-id DOMAIN_ID --subdomain SUB --apply；需要 HTTP 时执行 passnat tunnels create NAME --node-id NODE_ID --port-name PORT_NAME --protocol http --local-port APP_HTTP_PORT --subdomain SUB --domain-id DOMAIN_ID --apply",
-            "如果该设备确实有多个 HTTPS 应用，也只在该设备单独 init 一个共享底座，不复用当前设备的",
-        ], notes=["不要复制当前设备的 frpc 配置、隧道 ID 或进程身份。", "同一本机端口号不算冲突；归属按 port_name 判定。"])
+        # 目标设备按所选协议给出对应独立步骤，避免 TCP/HTTP 被误导去跑 preview up。
+        if protocol == "tcp":
+            target_steps = [
+                "在目标设备安装并验证 CLI：passnat auth check",
+                "在该设备已有或新创建的独立隧道上登记裸 TCP 映射：passnat ports add PORT_NAME --tunnel NEW_TUNNEL_ID --protocol tcp --local-port LOCAL_PORT --remote-port REMOTE_PORT --apply",
+            ]
+        elif protocol == "http":
+            target_steps = [
+                "在目标设备安装并验证 CLI：passnat auth check",
+                "在该设备单独创建 HTTP 隧道：passnat tunnels create NAME --node-id NODE_ID --port-name PORT_NAME --protocol http --local-port APP_HTTP_PORT --subdomain SUB --domain-id DOMAIN_ID --apply",
+            ]
+        else:
+            target_steps = [
+                "在目标设备安装并验证 CLI：passnat auth check",
+                "在该设备单独执行 passnat preview up NAME --tunnel NEW_TUNNEL_ID --local-port APP_HTTP_PORT --public-port 443 --domain-id DOMAIN_ID --subdomain SUB --apply",
+                "如果该设备确实有多个 HTTPS 应用，也只在该设备单独 init 一个共享底座，不复用当前设备的",
+            ]
+        return dict(base, mode="independent", reason="不同设备必须使用独立隧道与独立 frpc 身份，不要复用当前设备的共享底座。", steps=target_steps, notes=["不要复制当前设备的 frpc 配置、隧道 ID 或进程身份。", "同一本机端口号不算冲突；归属按 port_name 判定。"])
     if protocol == "https":
         if apps >= 2:
             return dict(base, mode="shared_https", reuse_shared=True, reason="同一设备、多个 HTTPS 应用：复用一条隧道、一个 Caddy、一个 frpc。", steps=[

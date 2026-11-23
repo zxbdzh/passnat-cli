@@ -272,6 +272,23 @@ class SharedTests(unittest.TestCase):
             self.assertEqual(Path(str(frpc_file) + '.previous').read_text('utf-8'), v1_frpc)
         self.assertFalse(list(Path(self.temp.name).glob('.validate-*')))
 
+    def test_sync_cleanup_oserror_does_not_mask_validation_failure(self):
+        self.client.config = lambda tunnel_id: (
+            'serverAddr = "8.8.8.8"\nserverPort = 7000\n[transport.tls]\nenable = true\n\n'
+            + '\n'.join(
+                f'[[proxies]]\nname = "{row["proxy_name"]}"\ntype = "https"\nlocalIP = "127.0.0.1"\nlocalPort = {row["local_port"]}\n'
+                for row in self.client.rows
+            )
+        )
+        add_site(self.client, 'dev', 'app1', 'app1', 3, 8000, None, [], True)
+        with patch('passnat.shared.checked', side_effect=Failure('runtime_command_failed', 'caddy validate failed')), \
+             patch('pathlib.Path.unlink', side_effect=PermissionError('locked')):
+            with self.assertRaises(Failure) as found:
+                sync(self.client, 'dev', True, False)
+        self.assertEqual(found.exception.code, 'runtime_command_failed')
+        for stray in Path(self.temp.name).glob('.validate-*'):
+            stray.unlink()
+
     def test_end_to_end_create_tunnel_to_shared_init_site_and_sync(self):
         tunnels = []
 
