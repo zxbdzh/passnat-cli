@@ -5,13 +5,14 @@ import os
 import tarfile
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
-from passnat.core import Failure
-from passnat.preview import CADDY_INSTALL_RECORD, CADDY_MACOS_ARCHIVE_SHA256, CADDY_MACOS_ASSET, CADDY_RELEASE, CADDY_WINDOWS_ASSET, find_caddy, find_frpc, install_caddy
+from passnat.core import Failure, load_state, save_state
+from passnat.preview import CADDY_INSTALL_RECORD, CADDY_MACOS_ARCHIVE_SHA256, CADDY_MACOS_ASSET, CADDY_RELEASE, CADDY_WINDOWS_ASSET, down, find_caddy, find_frpc, install_caddy, run, up
 
 APP_FRPC = Path("PassNAT.app/Contents/MacOS/frpc")
 SYSTEM_FRPC = Path("/Applications") / APP_FRPC
@@ -161,16 +162,61 @@ class FindCaddyTests(unittest.TestCase):
         path.chmod(mode)
         return path
 
+    def write_macos_install_record(self, target):
+        record = {
+            "version": "2.11.9",
+            "asset": CADDY_MACOS_ASSET,
+            "archive_sha256": CADDY_MACOS_ARCHIVE_SHA256,
+            "binary_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+        }
+        (target.parent / CADDY_INSTALL_RECORD).write_text(json.dumps(record), "utf-8")
+
     # --- macOS：只认受管 bin/caddy，不回退 Homebrew / PATH / 环境变量 ---------
 
     def test_macos_uses_managed_binary_even_when_env_and_path_exist(self):
         managed = self.executable("home/bin/caddy")
+        self.write_macos_install_record(managed)
         env_caddy = self.executable("env/caddy")
         on_path = self.executable("path/caddy")
         with patch.dict(os.environ, {"PASSNAT_HOME": str(self.home), "PASSNAT_CADDY": str(env_caddy)}), \
              patch("passnat.preview._caddy_platform", return_value="macos"), \
              patch("passnat.preview.shutil.which", return_value=str(on_path)):
             self.assertEqual(find_caddy(), str(managed.resolve()))
+
+    def test_macos_rejects_managed_binary_without_install_record(self):
+        self.executable("home/bin/caddy")
+        with patch.dict(os.environ, {"PASSNAT_HOME": str(self.home), "PASSNAT_CADDY": ""}), \
+             patch("passnat.preview._caddy_platform", return_value="macos"):
+            with self.assertRaises(Failure) as found:
+                find_caddy()
+        self.assertEqual(found.exception.code, "unexpected_file")
+
+    def test_macos_rejects_tampered_managed_binary(self):
+        managed = self.executable("home/bin/caddy")
+        self.write_macos_install_record(managed)
+        managed.write_bytes(b"tampered")
+        managed.chmod(0o755)
+        with patch.dict(os.environ, {"PASSNAT_HOME": str(self.home), "PASSNAT_CADDY": ""}), \
+             patch("passnat.preview._caddy_platform", return_value="macos"):
+            with self.assertRaises(Failure) as found:
+                find_caddy()
+        self.assertEqual(found.exception.code, "unexpected_file")
+
+    def test_macos_rejects_symlink_at_managed_binary(self):
+        outside = self.executable("outside/caddy")
+        managed = self.home / "bin" / "caddy"
+        managed.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            managed.symlink_to(outside)
+            symlink_guard = nullcontext()
+        except OSError:
+            symlink_guard = patch.object(Path, "is_symlink", autospec=True, side_effect=lambda path: path == managed)
+        with patch.dict(os.environ, {"PASSNAT_HOME": str(self.home), "PASSNAT_CADDY": ""}), \
+             patch("passnat.preview._caddy_platform", return_value="macos"), \
+             symlink_guard:
+            with self.assertRaises(Failure) as found:
+                find_caddy()
+        self.assertEqual(found.exception.code, "unsafe_path")
 
     def test_macos_ignores_env_and_path_without_managed_binary(self):
         env_caddy = self.executable("env/caddy")
@@ -547,8 +593,137 @@ class InstallCaddyTests(unittest.TestCase):
              patch("passnat.preview._fetch") as fetch:
             result = install_caddy()
         self.assertTrue(result["reused"])
+        self.assertNotIn("version", result)
         self.assertEqual(target.read_bytes(), b"existing")
         fetch.assert_not_called()
+
+
+class PreviewLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        env = patch.dict(os.environ, {"PASSNAT_HOME": str(self.home), "PASSNAT_CADDY": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _make_client(self, fail_tcp=False):
+        class ClientDouble:
+            def __init__(self):
+                self.rows = []
+                self.calls = []
+                self.deleted = False
+
+            def tunnel(self, tunnel_id):
+                return {
+                    "tunnel_id": tunnel_id,
+                    "name": "demo",
+                    "status": 2,
+                    "node_info": {"start_port": 10000, "end_port": 60000, "remote_ip": "8.8.8.8"},
+                    "proxy_info": list(self.rows),
+                }
+
+            def config(self, tunnel_id):
+                proxy_blocks = "\n".join(
+                    f'[[proxies]]\nname = "{row["proxy_name"]}"\ntype = "{row["protocol"]}"\nlocalIP = "127.0.0.1"\nlocalPort = {row["local_port"]}\n'
+                    for row in self.rows
+                )
+                return f'serverAddr = "8.8.8.8"\nserverPort = 7000\n[transport.tls]\nenable = true\n\n{proxy_blocks}'
+
+            def request(self, path, method="GET", data=None, **kwargs):
+                self.calls.append((path, method, data))
+                if path == "/user/domain/list":
+                    return [{"id": 3, "domain": "example.com", "status": 1}]
+                if path == "/user/tunnel/port/add":
+                    spec = dict(data["port_relation"][0])
+                    if fail_tcp and spec["protocol"] == "tcp":
+                        raise Failure("api_error", "tcp port rejected")
+                    self.rows.append(
+                        dict(
+                            spec,
+                            id=200 + len(self.rows),
+                            proxy_name=f'p-{spec["protocol"]}',
+                            domain=f'{spec.get("sub_domain", "demo")}.example.com',
+                        )
+                    )
+                    return {}
+                if path.startswith("/user/tunnel/del"):
+                    self.deleted = True
+                    return {}
+                if path.startswith("/user/tunnel/list"):
+                    return [] if self.deleted else [{"tunnel_id": "T1", "name": "demo"}]
+                return {}
+
+        return ClientDouble()
+
+    def test_up_apply_443_configures_frpc_and_caddy_successfully(self):
+        client = self._make_client()
+        with patch("passnat.preview.find_frpc", return_value="frpc.exe"), \
+             patch("passnat.preview.find_caddy", return_value="caddy.exe"), \
+             patch("passnat.preview.subprocess.run", return_value=type("R", (), {"returncode": 0})()):
+            result = up(client, "demo", "T1", 5000, 443, 18280, 54214, 3, "app", None, True)
+        self.assertTrue(result["configured"])
+        self.assertEqual(result["url"], "https://app.example.com/")
+        self.assertEqual(load_state("demo", "preview-")["status"], "configured")
+        self.assertTrue((self.home / "preview-demo.frpc.toml").is_file())
+        self.assertTrue((self.home / "preview-demo.Caddyfile").is_file())
+
+    def test_down_recovers_partial_preparing_preview_without_proxy_names(self):
+        client = self._make_client(fail_tcp=True)
+        save_state("demo", {"tunnel_id": "T1", "name": "demo", "status": "active"}, "create-")
+        with patch("passnat.preview.find_frpc", return_value="frpc.exe"), \
+             patch("passnat.preview.find_caddy", return_value="caddy.exe"):
+            with self.assertRaises(Failure) as found:
+                up(client, "demo", "T1", 5000, 18443, 18280, 54214, 3, "app", None, True)
+        self.assertEqual(found.exception.code, "api_error")
+        preview_state = load_state("demo", "preview-")
+        self.assertEqual(preview_state["status"], "preparing")
+        self.assertNotIn("proxy_names", preview_state)
+        self.assertEqual(load_state("demo-http")["status"], "active")
+        # 部分失败后无需 proxy_names，也必须允许正常 down 清理已建映射与专用隧道。
+        with patch("passnat.preview._stop_preview_caddy"):
+            plan = down(client, "demo", False)
+            self.assertTrue(plan["dry_run"])
+            self.assertEqual(plan["port_ids"], [200])
+            removed = down(client, "demo", True)
+        self.assertTrue(removed["removed"])
+        self.assertTrue(client.deleted)
+        self.assertEqual(load_state("demo", "preview-")["status"], "removed")
+        self.assertEqual(load_state("demo-http")["status"], "removed")
+
+    def test_run_raises_runtime_exit_on_nonzero_exit_code(self):
+        save_state("demo", {"status": "configured", "tunnel_id": "T1", "proxy_names": ["p-https"], "caddy": "caddy", "frpc": "frpc"}, "preview-")
+        (self.home / "preview-demo.Caddyfile").write_text("", "utf-8")
+        fake_child = type("Child", (), {"pid": 999, "stdout": io.StringIO("boot failed\n"), "wait": lambda self: 7})()
+        with patch("passnat.preview.subprocess.Popen", return_value=fake_child), \
+             patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(Failure) as found:
+                run("demo", "proxy")
+        self.assertEqual(found.exception.code, "runtime_exit")
+        self.assertIn("7", str(found.exception))
+
+    def test_down_refuses_tunnel_deletion_when_caddy_stop_returns_http_500(self):
+        client = self._make_client()
+        save_state("demo", {"tunnel_id": "T1", "name": "demo", "status": "active"}, "create-")
+        with patch("passnat.preview.find_frpc", return_value="frpc.exe"), \
+             patch("passnat.preview.find_caddy", return_value="caddy.exe"), \
+             patch("passnat.preview.subprocess.run", return_value=type("R", (), {"returncode": 0})()):
+            up(client, "demo", "T1", 5000, 443, 18280, 54214, 3, "app", None, True)
+
+        class FakeOpener:
+            def open(self, req, timeout=5):
+                url = req if isinstance(req, str) else req.full_url
+                if url.endswith("/config/"):
+                    return io.BytesIO(b'{"apps":{"http":{"servers":{"s":{"routes":[{"match":[{"host":["app.example.com"]}]}]}}}}}')
+                raise urllib.error.HTTPError(url, 500, "Internal Server Error", {}, None)
+
+        with patch("passnat.preview._port_listening", return_value=False), \
+             patch("passnat.preview.urllib.request.build_opener", return_value=FakeOpener()):
+            with self.assertRaises(Failure) as found:
+                down(client, "demo", True)
+        self.assertEqual(found.exception.code, "runtime_command_failed")
+        self.assertFalse(client.deleted)
+        self.assertEqual(load_state("demo", "preview-")["status"], "configured")
 
 
 if __name__ == "__main__":

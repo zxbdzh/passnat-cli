@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -95,9 +96,13 @@ def find_caddy() -> str:
     bin_dir = ensure_home() / "bin"
     if _caddy_platform() == "macos":
         managed = bin_dir / "caddy"
-        if _executable(managed):
-            return str(managed.resolve())
-        raise _caddy_missing()
+        if not managed.is_symlink() and not managed.exists():
+            raise _caddy_missing()
+        if not managed.is_symlink() and managed.is_file() and not os.access(managed, os.X_OK):
+            raise _caddy_missing()
+        # 实际解析同样复用普通文件、安装记录与 SHA-256 核验，与安装阶段保持同一信任边界。
+        _existing_caddy(managed, "macos")
+        return str(managed.resolve())
     candidates: list[str | Path | None] = [
         os.environ.get("PASSNAT_CADDY"),
         bin_dir / "caddy.exe",
@@ -181,7 +186,7 @@ def _existing_caddy(target: Path, system: str) -> dict:
         return {"installed": True, "path": str(target), "version": CADDY_VERSION, "reused": True, "checksum_verified": True, "checksum_algorithm": "sha256"}
     if not os.access(target, os.X_OK):
         raise Failure("unsafe_path", "托管路径已有不可执行文件，拒绝覆盖。", 3)
-    return {"installed": True, "path": str(target), "version": CADDY_VERSION, "reused": True}
+    return {"installed": True, "path": str(target), "reused": True}
 
 
 def install_caddy() -> dict:
@@ -370,7 +375,9 @@ def _run(name: str, component: str) -> dict:
                     line = line.replace(secret, "[REDACTED]")
             sys.stderr.write(line)
         code = child.wait()
-        return {"stopped": True, "component": component, "exit_code": code}
+        if code:
+            raise Failure("runtime_exit", f"预览 {component} 退出码 {code}。")
+        return {"stopped": True, "component": component}
     except KeyboardInterrupt:
         child.terminate()
         try:
@@ -403,19 +410,62 @@ def status(name: str) -> dict:
     return result
 
 
+def _port_listening(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def _stop_preview_caddy(state: dict) -> None:
+    admin_port = state.get("admin_port")
+    if not admin_port:
+        return
+    # 回环管理接口必须绕过系统代理，核对唯一域名后才发送停止请求。
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    admin = f"http://127.0.0.1:{admin_port}"
+    try:
+        with opener.open(admin + "/config/", timeout=5) as response:
+            cfg = response.read().decode("utf-8")
+    except urllib.error.HTTPError as error:
+        raise Failure("runtime_command_failed", f"无法核对本地 Caddy 管理接口（HTTP {error.code}），未继续回收隧道。") from None
+    except urllib.error.URLError as error:
+        if isinstance(error.reason, ConnectionRefusedError):
+            return
+        raise Failure("runtime_command_failed", "检查本地 Caddy 管理接口失败，未继续回收隧道。") from None
+    except (TimeoutError, OSError):
+        raise Failure("runtime_command_failed", "检查本地 Caddy 管理接口超时，未继续回收隧道。") from None
+    if state["domain"] not in cfg:
+        raise Failure("process_conflict", "本地代理身份不匹配，未停止该进程。")
+    try:
+        with opener.open(urllib.request.Request(admin + "/stop", data=b"", method="POST"), timeout=5):
+            pass
+    except urllib.error.HTTPError as error:
+        raise Failure("runtime_command_failed", f"停止本地 Caddy 失败（HTTP {error.code}），未继续回收隧道。") from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise Failure("runtime_command_failed", "停止本地 Caddy 失败，未继续回收隧道。") from None
+
+
 def down(client: Client, name: str, apply: bool) -> dict:
     state = load_state(name, "preview-")
     if not state:
         raise Failure("not_found", "未找到该预览。", 3)
     live = client.tunnel(state["tunnel_id"])
-    if any(row.get("proxy_name") not in state.get("proxy_names", []) for row in live.get("proxy_info", [])):
-        raise Failure("shared_tunnel_refused", "隧道中出现其他映射，拒绝自动下线。", 3)
     # 代理名不等于归属：同名映射可能已被改作其他服务，停进程或删隧道前须核对完整登记。
     records = {}
     for suffix in ("http", "tcp"):
         item = load_state(name + "-" + suffix)
         if item and item.get("tunnel_id") == state["tunnel_id"] and item.get("status") == "active":
             records[item.get("port_id")] = item
+    # preparing 阶段部分创建成功后可能尚未落盘 proxy_names，此时依据本预览已激活端口记录核对归属。
+    known_names = state.get("proxy_names")
+    for row in live.get("proxy_info", []):
+        if known_names is not None:
+            if row.get("proxy_name") not in known_names:
+                raise Failure("shared_tunnel_refused", "隧道中出现其他映射，拒绝自动下线。", 3)
+        elif row.get("id") not in records:
+            raise Failure("shared_tunnel_refused", "隧道中出现其他映射，拒绝自动下线。", 3)
     for row in live.get("proxy_info", []):
         item = records.get(row.get("id"))
         if not item or row.get("proxy_name") != item.get("proxy_name") or not matches(row, item["spec"]):
@@ -432,9 +482,14 @@ def down(client: Client, name: str, apply: bool) -> dict:
     planned = {"dry_run": not apply, "name": name, "remove_owned_tunnel": state["tunnel_id"], "port_ids": [row["id"] for row in live.get("proxy_info", [])]}
     if not apply:
         return planned
-    # 先停止本工具独立 frpc，再回收本预览拥有的映射；不会停止桌面客户端。
+    # 先确认并停止本机运行的独立 frpc 与 Caddy，再回收远端专用隧道；不会停止桌面客户端。
     config, _ = paths(name)
-    subprocess.run([state["frpc"], "stop", "-c", str(config)], capture_output=True, timeout=15)
+    admin_port = state.get("admin_port")
+    if config.is_file() and state.get("frpc") and admin_port and _port_listening(admin_port + 1):
+        stopped = subprocess.run([state["frpc"], "stop", "-c", str(config)], capture_output=True, timeout=15)
+        if stopped.returncode:
+            raise Failure("runtime_command_failed", "停止预览 frpc 失败，未继续回收隧道。")
+    _stop_preview_caddy(state)
     client.request("/user/tunnel/del?" + urllib.parse.urlencode({"tid": state["tunnel_id"]}), "DELETE")
     remaining = client.request("/user/tunnel/list?page=1&size=100")
     if any(item["tunnel_id"] == state["tunnel_id"] for item in remaining):
@@ -447,17 +502,6 @@ def down(client: Client, name: str, apply: bool) -> dict:
         if port:
             port["status"] = "removed"
             save_state(name + "-" + suffix, port)
-    # Caddy 的管理接口只绑定回环；核对唯一域名后才允许关闭，避免端口重用误停其他实例。
-    admin = f'http://127.0.0.1:{state["admin_port"]}'
-    try:
-        with urllib.request.urlopen(admin + "/config/", timeout=5) as response:
-            cfg = response.read().decode("utf-8")
-        if state["domain"] not in cfg:
-            raise Failure("process_conflict", "本地代理身份不匹配，未停止该进程。")
-        with urllib.request.urlopen(urllib.request.Request(admin + "/stop", data=b"", method="POST"), timeout=5):
-            pass
-    except (urllib.error.URLError, TimeoutError, OSError):
-        pass
     state["status"] = "removed"
     save_state(name, state, "preview-")
     return {"removed": True, "name": name, "url": state["url"]}
